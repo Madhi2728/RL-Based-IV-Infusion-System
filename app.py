@@ -59,6 +59,62 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
     return chart
 
 
+SPLASH_SECONDS = 3.0
+
+# Self-contained splash: inline SVG + CSS keyframes, no external assets.
+SPLASH_HTML = """
+<style>
+.iv-splash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 70vh;
+  text-align: center;
+}
+.iv-splash-title { font-size: 2.3rem; font-weight: 700; letter-spacing: -0.01em; }
+.iv-splash-sub { font-size: 1.1rem; opacity: 0.75; margin-top: 0.25rem; }
+.iv-splash-caption { font-size: 0.9rem; opacity: 0.6; margin-top: 0.75rem; }
+.iv-splash svg { margin-top: 1.5rem; }
+@keyframes iv-drip {
+  0%   { transform: translateY(0px);  opacity: 0; }
+  12%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: translateY(42px); opacity: 0; }
+}
+.iv-drop { animation: iv-drip 1s linear infinite; }
+</style>
+<div class="iv-splash">
+  <div class="iv-splash-title">IV Infusion Flow Control</div>
+  <div class="iv-splash-sub">PID vs Q-learning vs DQN</div>
+  <svg width="170" height="240" viewBox="0 0 170 240" role="img" aria-label="Animated IV drip">
+    <line x1="85" y1="2" x2="85" y2="14" stroke="#5599c7" stroke-width="2"/>
+    <rect x="53" y="14" width="64" height="86" rx="10" ry="10"
+          fill="#5599c7" fill-opacity="0.18" stroke="#5599c7" stroke-width="2"/>
+    <path d="M53 46 h64 v44 a10 10 0 0 1 -10 10 h-44 a10 10 0 0 1 -10 -10 z"
+          fill="#5599c7" fill-opacity="0.38"/>
+    <path d="M79 100 L91 100 L85 112 Z" fill="#5599c7"/>
+    <ellipse cx="85" cy="140" rx="16" ry="26" fill="none" stroke="#5599c7" stroke-width="2"/>
+    <line x1="85" y1="166" x2="85" y2="232" stroke="#5599c7" stroke-width="2"/>
+    <circle class="iv-drop" cx="85" cy="116" r="4.5" fill="#5599c7"/>
+  </svg>
+  <div class="iv-splash-caption">Loading simulation...</div>
+</div>
+"""
+
+
+def show_splash_once():
+    """Full-screen splash, shown only on the very first load of the session.
+    Subsequent reruns (widget changes, Play/Step, auto-run ticks) skip it."""
+    if st.session_state.get("splash_shown"):
+        return
+    placeholder = st.empty()
+    placeholder.markdown(SPLASH_HTML, unsafe_allow_html=True)
+    time.sleep(SPLASH_SECONDS)
+    placeholder.empty()
+    st.session_state.splash_shown = True
+
+
 def last_occlusion_window(k_eff_series):
     """Positional (start, end) bounds of the most recent contiguous run of
     k_eff < 1 in the episode history, or None if no occlusion has occurred.
@@ -208,6 +264,8 @@ def step_all():
     ss.rows.append(row)
     ss.t += 1
 
+
+show_splash_once()
 
 st.title("IV Infusion Flow Control: PID vs Q-learning vs DQN")
 st.caption(
