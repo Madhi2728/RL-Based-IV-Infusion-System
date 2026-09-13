@@ -12,6 +12,7 @@ Run with:
     streamlit run app.py
 """
 
+import json
 import time
 
 import altair as alt
@@ -33,6 +34,7 @@ ERR_BINS, DERR_BINS, PENDING_BINS = 21, 11, 7
 ERR_CLIP, DERR_CLIP, PENDING_CLIP = 60.0, 15.0, 40.0
 N_ACTIONS = 7
 ACTIONS = np.array([-8, -4, -1, 0, 1, 4, 8], dtype=float)
+SAFE_BAND = 5.0  # mL/hr, matches IVInfusionEnv.safe_band
 
 # Fixed axis ranges so the chart doesn't rescale (and visually jump) on every
 # Play/Step rerun as new data points arrive.
@@ -55,6 +57,48 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
         )
     )
     return chart
+
+
+def last_occlusion_window(k_eff_series):
+    """Positional (start, end) bounds of the most recent contiguous run of
+    k_eff < 1 in the episode history, or None if no occlusion has occurred.
+    Includes an occlusion still in progress."""
+    occluded = (k_eff_series < 1.0).to_numpy()
+    if not occluded.any():
+        return None
+    end = len(occluded) - 1
+    while not occluded[end]:
+        end -= 1
+    start = end
+    while start > 0 and occluded[start - 1]:
+        start -= 1
+    return start, end
+
+
+def best_by(values, lower_is_better=True):
+    """(label, value) of the winning controller(s). Ties are reported as ties
+    rather than silently resolved by dict order, which would always favour
+    whichever controller happens to be inserted first."""
+    target = min(values.values()) if lower_is_better else max(values.values())
+    winners = [name for name, v in values.items() if v == target]
+    label = winners[0] if len(winners) == 1 else ", ".join(winners) + " (tied)"
+    return label, target
+
+
+def load_batch_summary(path="results/eval_summary.json"):
+    """Batch metrics written by src/evaluate.py, or None if it hasn't been run."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def batch_summary_table(batch):
+    rows = {}
+    for controller, metrics in batch["controllers"].items():
+        rows[controller] = {k: v["mean"] for k, v in metrics.items()}
+    return pd.DataFrame(rows).round(2)
 
 
 def discretize(err, derr, pending):
@@ -171,6 +215,27 @@ st.caption(
     "controllers. Trigger an occlusion mid-run and watch each one recover."
 )
 
+with st.expander("What am I looking at?"):
+    st.markdown(
+        "- **Random seed**: only fixes the sensor-noise realization, so the same seed "
+        "reproduces the exact same run. It does **not** change difficulty.\n"
+        "- **Occlusion severity (k_eff)**: **multiplicative** — scales how much of the "
+        "commanded flow actually reaches the patient (e.g. 0.4 = only 40% gets through). "
+        "Models a kinked line or positional occlusion against a vein wall. This attacks "
+        "the controller's *authority* over the line.\n"
+        "- **Occlusion duration**: how long that reduced k_eff persists before the line "
+        "clears back to k_eff = 1.0.\n"
+        "- **Pressure disturbance (d_p)**: **additive** — adds or subtracts flow "
+        "regardless of what's commanded. Models bag height changes, patient arm movement, "
+        "or venous back-pressure. This attacks the *output*, not the authority — even a "
+        "perfect command doesn't cancel it directly, the controller has to react to the "
+        "resulting error."
+    )
+
+col_play, col_auto = st.columns([1, 1])
+play = col_play.button("Play / Step")
+autoplay = col_auto.checkbox("Auto-run", value=False)
+
 with st.sidebar:
     st.header("Setup")
     target_flow = st.slider("Target flow rate (mL/hr)", 50, 200, 100, step=5)
@@ -210,11 +275,6 @@ with st.sidebar:
         if "controllers" in st.session_state:
             st.session_state.d_p = pressure_bump
 
-    st.divider()
-    col_a, col_b = st.columns(2)
-    play = col_a.button("Play / Step")
-    autoplay = col_b.checkbox("Auto-run", value=False)
-
 if "controllers" not in st.session_state:
     init_session(target_flow, int(seed), episode_len, ql_agent, dqn_agent)
 
@@ -230,18 +290,65 @@ if st.session_state.rows:
 
     flow_cols = ["target"] + [f"{name} flow" for name in active_names]
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
-    st.altair_chart(flow_chart, use_container_width=True, key="flow_chart")
+    st.altair_chart(flow_chart, width="stretch", key="flow_chart")
 
     command_cols = [f"{name} command" for name in active_names]
     command_chart = fixed_range_line_chart(df, command_cols, COMMAND_Y_DOMAIN, "Command (mL/hr)")
-    st.altair_chart(command_chart, use_container_width=True, key="command_chart")
+    st.altair_chart(command_chart, width="stretch", key="command_chart")
 
     st.subheader("Running error stats (this episode so far)")
+    abs_err = {name: (df["target"] - df[f"{name} flow"]).abs() for name in active_names}
     cols = st.columns(len(active_names))
     for col, name in zip(cols, active_names):
-        err = df["target"] - df[f"{name} flow"]
-        col.metric(f"{name} mean |error| (mL/hr)", f"{err.abs().mean():.2f}")
+        col.metric(f"{name} mean |error| (mL/hr)", f"{abs_err[name].mean():.2f}")
         col.metric(f"{name} current flow (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
+
+    mean_errors = {name: float(e.mean()) for name, e in abs_err.items()}
+    max_errors = {name: float(e.max()) for name, e in abs_err.items()}
+    in_band = {name: float((e <= SAFE_BAND).mean() * 100.0) for name, e in abs_err.items()}
+
+    best_mean, best_mean_val = best_by(mean_errors)
+    best_max, best_max_val = best_by(max_errors)
+    best_band, best_band_val = best_by(in_band, lower_is_better=False)
+
+    st.markdown(f"- **Best mean absolute error:** `{best_mean}` at {best_mean_val:.2f} mL/hr")
+    st.markdown(f"- **Best worst-case (max) absolute error:** `{best_max}` at {best_max_val:.2f} mL/hr")
+    st.markdown(f"- **Best time in +-{SAFE_BAND:.0f} mL/hr safe band:** `{best_band}` at {best_band_val:.1f}%")
+
+    occ_window = last_occlusion_window(df["k_eff"])
+    if occ_window is None:
+        st.markdown("- **Best recovery:** no occlusion triggered yet this episode")
+    else:
+        start, end = occ_window
+        recovery = {name: float(e.iloc[start:end + 1].mean()) for name, e in abs_err.items()}
+        best_recovery, best_recovery_val = best_by(recovery)
+        st.markdown(
+            f"- **Best recovery** (mean absolute error during last occlusion, "
+            f"t={df.index[start]}-{df.index[end]} s): "
+            f"`{best_recovery}` at {best_recovery_val:.2f} mL/hr"
+        )
+
+    st.caption(
+        "Different metrics favour different controllers - mean error rewards steady "
+        "tracking, worst-case error rewards avoiding large excursions, recovery rewards "
+        "disturbance rejection."
+    )
+
+    batch = load_batch_summary()
+    st.subheader("Batch evaluation (30 held-out episodes)")
+    if batch is None:
+        st.info(
+            "No batch summary found at `results/eval_summary.json` -- run "
+            "`python -m src.evaluate --n_eval 30 --dqn_model results/dqn_model.pt` to generate it."
+        )
+    else:
+        st.caption(
+            f"From `src/evaluate.py` over {batch['n_eval']} held-out eval-mode episodes. "
+            "Single-episode live numbers above are noisy; this batch result is the "
+            "statistically sound comparison. Lower is better for all rows except "
+            "% time in safe band."
+        )
+        st.dataframe(batch_summary_table(batch), width="stretch")
 else:
     st.info("Click **Reset episode** in the sidebar to start.")
 

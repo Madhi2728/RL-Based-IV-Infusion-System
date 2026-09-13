@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -105,6 +106,22 @@ def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="
     rl_summary = summarize(rl_metrics, "Q-learning agent")
     pid_summary = summarize(pid_metrics, "PID baseline")
     dqn_summary = summarize(dqn_metrics, "DQN agent") if dqn_model_path is not None else None
+
+    # Persist the batch summary so other tools (app.py) can show these numbers
+    # instead of duplicating/hardcoding them.
+    summary_json = {
+        "n_eval": n_eval,
+        "controllers": {
+            name: {k: {"mean": v[0], "std": v[1]} for k, v in summary.items()}
+            for name, summary in [("Q-learning", rl_summary), ("PID", pid_summary),
+                                   ("DQN", dqn_summary)]
+            if summary is not None
+        },
+    }
+    summary_path = f"{out_prefix}_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary_json, f, indent=2)
+    print(f"\nSaved batch summary to {summary_path}")
 
     # example-episode comparison plot
     panels = [(example_rl, "Q-learning agent"), (example_pid, "PID baseline")]
