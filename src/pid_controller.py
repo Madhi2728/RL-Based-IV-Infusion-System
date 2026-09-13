@@ -10,7 +10,7 @@ u(t) = Kp*e(t) + Ki*integral(e) + Kd*de/dt   (with integral anti-windup clamp)
 
 
 class PIDController:
-    def __init__(self, kp=2.0, ki=0.4, kd=0.5, dt=1.0, u_min=0.0, u_max=400.0,
+    def __init__(self, kp=0.6, ki=0.08, kd=0.2, dt=1.0, u_min=0.0, u_max=400.0,
                  integral_limit=1500.0):
         self.kp, self.ki, self.kd = kp, ki, kd
         self.dt = dt

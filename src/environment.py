@@ -34,32 +34,59 @@ K_eff(t) or d_p(t) directly -- it only observes the resulting flow error,
 exactly like a real infusion pump's closed-loop drop-rate control.
 
 Discretized with Euler integration at dt seconds per control step.
+
+TRANSPORT DELAY
+===============
+Real IV lines have a meaningful dead time between a pump command changing and
+that change reaching the patient end of the tubing (line length, pump
+mechanism response, sensor placement). This is modeled as a pure transport
+delay of `delay_steps * dt` seconds: the command issued at time t only starts
+affecting the plant ODE at time t + delay.
+
+This delay is what makes the control problem genuinely hard for PID: a
+fixed-gain PID has no internal model of "how much correction is already in
+flight but hasn't landed yet," so with a large delay-to-time-constant ratio it
+either has to be detuned (slow, sluggish) or it overcorrects on stale error
+and oscillates/rings. Classical process control handles this with a
+model-based dead-time compensator (a Smith predictor) bolted onto the PID --
+but that is a structural redesign, not a tuning fix. An RL agent, by
+contrast, can be given a state feature that exposes exactly this "control
+already in the pipe" quantity, and learn to act on it without any explicit
+delay model -- so this environment gives the RL state that extra feature
+while the PID baseline remains the standard, undesigned-for-delay controller
+a real deployment would actually use.
 """
 
 import numpy as np
 
 
 class IVInfusionPlant:
-    """Continuous-time plant dynamics, Euler-integrated."""
+    """Continuous-time plant dynamics, Euler-integrated, with transport delay."""
 
-    def __init__(self, tau=8.0, dt=1.0, u_max=400.0, q_max=500.0, noise_std=0.5, seed=None):
+    def __init__(self, tau=8.0, dt=1.0, u_max=400.0, q_max=500.0, noise_std=0.5,
+                 delay_steps=6, seed=None):
         self.tau = tau
         self.dt = dt
         self.u_max = u_max      # max pump command, mL/hr
         self.q_max = q_max      # max physically deliverable flow, mL/hr
         self.noise_std = noise_std
+        self.delay_steps = delay_steps
         self.rng = np.random.default_rng(seed)
 
         self.Q = 0.0            # actual delivered flow (mL/hr)
-        self.u = 0.0            # current pump command (mL/hr)
+        self.u = 0.0            # current (just-issued) pump command (mL/hr)
+        self.u_applied = 0.0    # command actually driving the ODE right now (delayed)
         self.k_eff = 1.0        # effective line gain (occlusion factor)
         self.d_p = 0.0          # hydrostatic/back-pressure disturbance
+        self._cmd_queue = [0.0] * delay_steps
 
     def reset(self, start_flow=0.0):
         self.Q = start_flow
         self.u = start_flow
+        self.u_applied = start_flow
         self.k_eff = 1.0
         self.d_p = 0.0
+        self._cmd_queue = [start_flow] * self.delay_steps
         return self.Q
 
     def set_command(self, u):
@@ -72,8 +99,17 @@ class IVInfusionPlant:
     def apply_pressure_disturbance(self, d_p):
         self.d_p = float(d_p)
 
+    def pending_correction(self):
+        """How much commanded change hasn't reached the plant yet (u - u_applied).
+        Exposed to the RL state only -- PID never sees this."""
+        return self.u - self.u_applied
+
     def step(self):
-        dQ = (self.k_eff * self.u - self.Q + self.d_p) / self.tau
+        # push latest command into the delay line, pop the one that lands now
+        self._cmd_queue.append(self.u)
+        self.u_applied = self._cmd_queue.pop(0)
+
+        dQ = (self.k_eff * self.u_applied - self.Q + self.d_p) / self.tau
         self.Q = self.Q + self.dt * dQ
         self.Q = float(np.clip(self.Q, 0.0, self.q_max))
         measured_Q = self.Q + self.rng.normal(0.0, self.noise_std)
@@ -128,8 +164,13 @@ class IVInfusionEnv:
     RL environment around IVInfusionPlant.
 
     STATE (discretized for tabular Q-learning):
-        e      = target_flow - measured_flow            (error, mL/hr)
-        de     = e - e_prev                              (error rate)
+        e      = target_flow - measured_flow             (error, mL/hr)
+        de     = e - e_prev                               (error rate)
+        p      = u - u_applied                            (pending correction
+                                                             still "in flight"
+                                                             through the delay
+                                                             line -- PID never
+                                                             sees this feature)
       -> each binned into discrete buckets -> single integer state index
 
     ACTION (discrete pump-command adjustments, mL/hr):
@@ -148,24 +189,27 @@ class IVInfusionEnv:
     ACTIONS = np.array([-8, -4, -1, 0, 1, 4, 8], dtype=float)
 
     def __init__(self, dt=1.0, episode_len=180.0, seed=None,
-                 err_bins=21, derr_bins=11, err_clip=60.0, derr_clip=15.0,
-                 mode="train"):
+                 err_bins=21, derr_bins=11, pending_bins=7,
+                 err_clip=60.0, derr_clip=15.0, pending_clip=40.0,
+                 delay_steps=10, mode="train"):
         self.dt = dt
         self.episode_len = episode_len
         self.rng = np.random.default_rng(seed)
-        self.plant = IVInfusionPlant(dt=dt, seed=seed)
+        self.plant = IVInfusionPlant(dt=dt, delay_steps=delay_steps, seed=seed)
         self.mode = mode
         self.scheduler = DisturbanceScheduler(episode_len, dt, self.rng, mode=mode)
 
         self.err_bins = err_bins
         self.derr_bins = derr_bins
+        self.pending_bins = pending_bins
         self.err_clip = err_clip
         self.derr_clip = derr_clip
+        self.pending_clip = pending_clip
 
         self.safe_band = 5.0     # mL/hr - clinically acceptable error band
         self.tight_band = 1.5    # mL/hr - "settled" band for bonus
 
-        self.n_states = err_bins * derr_bins
+        self.n_states = err_bins * derr_bins * pending_bins
         self.n_actions = len(self.ACTIONS)
 
         self.target = 100.0
@@ -200,15 +244,17 @@ class IVInfusionEnv:
         measured = self.plant.Q
         err = self.target - measured
         self.prev_err = err
-        state = self._discretize(err, 0.0)
+        state = self._discretize(err, 0.0, self.plant.pending_correction())
         return state
 
-    def _discretize(self, err, derr):
+    def _discretize(self, err, derr, pending):
         e_idx = int(np.clip((err + self.err_clip) / (2 * self.err_clip) * self.err_bins,
                              0, self.err_bins - 1))
         de_idx = int(np.clip((derr + self.derr_clip) / (2 * self.derr_clip) * self.derr_bins,
                               0, self.derr_bins - 1))
-        return e_idx * self.derr_bins + de_idx
+        p_idx = int(np.clip((pending + self.pending_clip) / (2 * self.pending_clip) * self.pending_bins,
+                             0, self.pending_bins - 1))
+        return (e_idx * self.derr_bins + de_idx) * self.pending_bins + p_idx
 
     def step(self, action_idx):
         du = self.ACTIONS[action_idx]
@@ -243,5 +289,5 @@ class IVInfusionEnv:
         self.prev_err = err
         self.step_idx += 1
         done = self.step_idx >= self.n_steps
-        next_state = self._discretize(err, derr)
+        next_state = self._discretize(err, derr, self.plant.pending_correction())
         return next_state, reward, done, {}

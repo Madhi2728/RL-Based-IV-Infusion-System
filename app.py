@@ -14,6 +14,7 @@ Run with:
 
 import time
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,6 +32,28 @@ ERR_BINS, DERR_BINS = 21, 11
 ERR_CLIP, DERR_CLIP = 60.0, 15.0
 N_ACTIONS = 7
 ACTIONS = np.array([-8, -4, -1, 0, 1, 4, 8], dtype=float)
+
+# Fixed axis ranges so the chart doesn't rescale (and visually jump) on every
+# Play/Step rerun as new data points arrive.
+FLOW_Y_DOMAIN = (0, 200)
+COMMAND_Y_DOMAIN = (0, 400)
+
+
+def fixed_range_line_chart(df, cols, y_domain, y_title):
+    """Multi-line chart with a pinned y-axis domain, built with Altair (st.line_chart
+    has no axis-range control and autoranges, which is what causes the jump/flicker
+    as new rows are appended)."""
+    long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
+    chart = (
+        alt.Chart(long_df)
+        .mark_line()
+        .encode(
+            x=alt.X("t", title="Time (s)"),
+            y=alt.Y("value", title=y_title, scale=alt.Scale(domain=list(y_domain))),
+            color=alt.Color("series", title=None),
+        )
+    )
+    return chart
 
 
 def discretize(err, derr):
@@ -198,27 +221,24 @@ if play:
 if autoplay and st.session_state.t < st.session_state.n_steps:
     step_all()
 
-chart_placeholder = st.empty()
-command_placeholder = st.empty()
-metrics_placeholder = st.empty()
-
 if st.session_state.rows:
     df = pd.DataFrame(st.session_state.rows).set_index("t")
     active_names = list(st.session_state.controllers.keys())
 
     flow_cols = ["target"] + [f"{name} flow" for name in active_names]
-    chart_placeholder.line_chart(df[flow_cols])
+    flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
+    st.altair_chart(flow_chart, use_container_width=True, key="flow_chart")
 
     command_cols = [f"{name} command" for name in active_names]
-    command_placeholder.line_chart(df[command_cols])
+    command_chart = fixed_range_line_chart(df, command_cols, COMMAND_Y_DOMAIN, "Command (mL/hr)")
+    st.altair_chart(command_chart, use_container_width=True, key="command_chart")
 
-    with metrics_placeholder.container():
-        st.subheader("Running error stats (this episode so far)")
-        cols = st.columns(len(active_names))
-        for col, name in zip(cols, active_names):
-            err = df["target"] - df[f"{name} flow"]
-            col.metric(f"{name} mean |error| (mL/hr)", f"{err.abs().mean():.2f}")
-            col.metric(f"{name} current flow (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
+    st.subheader("Running error stats (this episode so far)")
+    cols = st.columns(len(active_names))
+    for col, name in zip(cols, active_names):
+        err = df["target"] - df[f"{name} flow"]
+        col.metric(f"{name} mean |error| (mL/hr)", f"{err.abs().mean():.2f}")
+        col.metric(f"{name} current flow (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
 else:
     st.info("Click **Reset episode** in the sidebar to start.")
 
