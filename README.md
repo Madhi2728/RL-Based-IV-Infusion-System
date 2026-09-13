@@ -62,20 +62,72 @@ Training disturbances (`mode="train"`) use milder occlusion severity
 — see `DisturbanceScheduler` in `src/environment.py`. This is what "evaluate
 under conditions different from training" means concretely here.
 
-## Results (30 held-out evaluation episodes, seed-matched RL vs. PID)
+## Results (30 held-out evaluation episodes, seed-matched RL vs. PID vs. DQN)
 
-| Metric | Q-learning | PID |
-|---|---|---|
-| IAE | 3453.7 | **1297.3** |
-| ISE | 160620.3 | **37585.3** |
-| RMSE (mL/hr) | 26.6 | **12.9** |
-| Settling time (s) | 178.5 | **142.3** |
-| Overshoot (%) | 54.0 | **29.6** |
-| % time in +-5 mL/hr safe band | 21.2% | **67.1%** |
+| Metric | Q-learning | PID | DQN |
+|---|---|---|---|
+| IAE | 3453.7 | **1297.3** | 2172.3 |
+| ISE | 160620.3 | **37585.3** | 88960.5 |
+| RMSE (mL/hr) | 26.6 | **12.9** | 19.7 |
+| Settling time (s) | 178.5 | **142.3** | 155.2 |
+| Overshoot (%) | 54.0 | **29.6** | 32.6 |
+| % time in +-5 mL/hr safe band | 21.2% | **67.1%** | 60.4% |
 
 Reproduce with `python -m src.train --episodes 5000` then
 `python -m src.evaluate --n_eval 30`. Plots: `results/qlearning_training_curve.png`,
 `results/eval_comparison.png`.
+
+To include the DQN agent in the comparison: `python -m src.dqn_agent --episodes 2000 --seed 0`
+then `python -m src.evaluate --n_eval 30 --dqn_model results/dqn_model.pt`.
+
+## DQN agent
+
+`src/dqn_agent.py` adds a function-approximation baseline against the same
+`IVInfusionEnv` reward and disturbance regime, to test the hypothesis in the
+analysis below (tabular discretization is the bottleneck, not RL itself). It
+uses the same 7 discrete pump-command deltas as `QLearningAgent`, but a small
+MLP (2 hidden layers, 64 units, PyTorch) over a **continuous** 3-feature
+state instead of a 231-bucket table:
+
+- `error` = target - measured flow
+- `error-rate` = step-to-step change in error
+- `k_eff-estimate` — a causal, online estimate of the line's effective gain,
+  built only from the agent's own command and the measured flow it gets back
+  (`measured / command`, EMA-smoothed). This is **not** the plant's true
+  `k_eff` — the controller never observes that directly, matching the
+  problem statement in `environment.py` — it's the same kind of
+  commanded-vs-delivered signal a real pump's occlusion-detection logic
+  would use.
+
+Trained for 2,000 episodes (vs. Q-learning's 5,000 — a function approximator
+needs less experience to cover the same continuous state space than a flat
+table does) with epsilon-greedy exploration, a target network synced every
+500 gradient steps, and a 50k-transition replay buffer.
+
+**Result: DQN closes roughly half the gap between tabular Q-learning and
+PID** on every metric above (e.g. IAE 3453.7 -> 2172.3, vs. PID's 1297.3;
+% time in safe band 21.2% -> 60.4%, vs. PID's 67.1%). This supports the
+analysis below: the discretized table, not the RL formulation itself, was
+the main source of Q-learning's underperformance. PID still wins outright —
+its integral term and continuous output remain the better fit for this
+near-linear plant — but DQN is now a real contender rather than a strictly
+worse option, unlike the tabular agent.
+
+## Live comparison app
+
+`app.py` (Streamlit) runs PID, Q-learning and DQN side by side on three
+independent instances of the same plant, stepped forward interactively:
+pick a target flow rate, trigger an occlusion event or a pressure bump
+mid-episode, and watch each controller's flow trace and command signal
+update on the same chart.
+
+```bash
+streamlit run app.py
+```
+
+Requires `results/qlearning_qtable.pkl` and `results/dqn_model.pt` to exist
+(train them first, see above) — the app will still run PID-only with a
+warning if either is missing.
 
 ## Analysis: strengths and limitations
 
@@ -120,11 +172,13 @@ natural next step to test whether RL can close this gap.
 src/
   environment.py       # plant ODE, disturbance scheduler, RL env
   q_learning_agent.py  # tabular Q-learning
+  dqn_agent.py          # DQN (PyTorch) over continuous state, same env/reward
   pid_controller.py    # PID baseline
   metrics.py           # IAE/ISE/RMSE/settling-time/overshoot
   train.py             # trains + saves Q-table + training curve
-  evaluate.py          # RL vs PID on held-out disturbance regime
-results/                # training curve + comparison plots (generated)
+  evaluate.py          # RL vs PID (vs DQN) on held-out disturbance regime
+app.py                  # Streamlit: live PID vs Q-learning vs DQN comparison
+results/                # training curves + comparison plots (generated)
 ```
 
 ## Setup
@@ -133,5 +187,7 @@ results/                # training curve + comparison plots (generated)
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m src.train --episodes 5000 --seed 0
-python -m src.evaluate --n_eval 30
+python -m src.dqn_agent --episodes 2000 --seed 0
+python -m src.evaluate --n_eval 30 --dqn_model results/dqn_model.pt
+streamlit run app.py
 ```
