@@ -59,7 +59,7 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
     return chart
 
 
-SPLASH_SECONDS = 3.0
+SPLASH_SECONDS = 5.0
 
 # Self-contained splash: inline SVG + CSS keyframes, no external assets.
 SPLASH_HTML = """
