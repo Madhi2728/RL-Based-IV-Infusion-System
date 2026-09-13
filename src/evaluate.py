@@ -22,6 +22,7 @@ from src.environment import IVInfusionEnv
 from src.q_learning_agent import QLearningAgent
 from src.pid_controller import PIDController
 from src.metrics import compute_metrics
+from src.dqn_agent import DQNAgent, KEffEstimator, run_dqn_episode
 
 
 def run_rl_episode(seed, qtable_path):
@@ -34,6 +35,14 @@ def run_rl_episode(seed, qtable_path):
         a = agent.select_action(s, greedy=True)
         s, r, done, _ = env.step(a)
     return env.history
+
+
+def run_dqn_eval_episode(seed, model_path):
+    env = IVInfusionEnv(seed=seed, mode="eval")
+    agent = DQNAgent(env.n_actions)
+    agent.load(model_path)
+    history, _ = run_dqn_episode(env, agent, KEffEstimator(), greedy=True)
+    return history
 
 
 def run_pid_episode(seed, kp=0.6, ki=0.08, kd=0.2):
@@ -64,9 +73,10 @@ def run_pid_episode(seed, kp=0.6, ki=0.08, kd=0.2):
     return env.history
 
 
-def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="results/eval"):
-    rl_metrics, pid_metrics = [], []
-    example_rl, example_pid = None, None
+def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="results/eval",
+             dqn_model_path=None):
+    rl_metrics, pid_metrics, dqn_metrics = [], [], []
+    example_rl, example_pid, example_dqn = None, None, None
 
     for i in range(n_eval):
         seed = 10_000 + i
@@ -74,8 +84,13 @@ def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="
         h_pid = run_pid_episode(seed)
         rl_metrics.append(compute_metrics(h_rl))
         pid_metrics.append(compute_metrics(h_pid))
+        if dqn_model_path is not None:
+            h_dqn = run_dqn_eval_episode(seed, dqn_model_path)
+            dqn_metrics.append(compute_metrics(h_dqn))
         if i == 0:
             example_rl, example_pid = h_rl, h_pid
+            if dqn_model_path is not None:
+                example_dqn = h_dqn
 
     def summarize(metric_list, name):
         keys = metric_list[0].keys()
@@ -89,10 +104,16 @@ def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="
 
     rl_summary = summarize(rl_metrics, "Q-learning agent")
     pid_summary = summarize(pid_metrics, "PID baseline")
+    dqn_summary = summarize(dqn_metrics, "DQN agent") if dqn_model_path is not None else None
 
     # example-episode comparison plot
-    fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
-    for ax, hist, title in zip(axes, [example_rl, example_pid], ["Q-learning agent", "PID baseline"]):
+    panels = [(example_rl, "Q-learning agent"), (example_pid, "PID baseline")]
+    if dqn_model_path is not None:
+        panels.append((example_dqn, "DQN agent"))
+    fig, axes = plt.subplots(len(panels), 1, figsize=(9, 3.5 * len(panels)), sharex=True)
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (hist, title) in zip(axes, panels):
         t = [h["t"] for h in hist]
         ax.plot(t, [h["target"] for h in hist], "k--", label="target")
         ax.plot(t, [h["measured"] for h in hist], label="measured flow")
@@ -107,6 +128,8 @@ def evaluate(n_eval=20, qtable_path="results/qlearning_qtable.pkl", out_prefix="
     plt.savefig(f"{out_prefix}_comparison.png", dpi=150)
     print(f"\nSaved comparison plot to {out_prefix}_comparison.png")
 
+    if dqn_model_path is not None:
+        return rl_summary, pid_summary, dqn_summary
     return rl_summary, pid_summary
 
 
@@ -114,5 +137,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_eval", type=int, default=20)
     parser.add_argument("--qtable", type=str, default="results/qlearning_qtable.pkl")
+    parser.add_argument("--dqn_model", type=str, default=None,
+                         help="Optional path to a trained DQN model (results/dqn_model.pt) to include in the comparison")
     args = parser.parse_args()
-    evaluate(n_eval=args.n_eval, qtable_path=args.qtable)
+    evaluate(n_eval=args.n_eval, qtable_path=args.qtable, dqn_model_path=args.dqn_model)

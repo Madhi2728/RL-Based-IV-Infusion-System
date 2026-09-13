@@ -4,15 +4,22 @@ dqn_agent.py
 DQN agent (PyTorch) for IV infusion flow control, using the same
 IVInfusionEnv/reward as the tabular Q-learning agent and PID baseline, but
 operating on a continuous state representation instead of the env's
-discretized (error, error-rate) bucket index:
+discretized (error, error-rate, pending-correction) bucket index:
 
-    state = (error, error-rate, k_eff_estimate)
+    state = (error, error-rate, pending_correction, k_eff_estimate)
 
 `error` and `error-rate` come straight from the env's per-step history
-(target - measured flow, and its step-to-step change). `k_eff_estimate` is
-NOT the plant's true occlusion factor -- the controller never observes that
-directly (see environment.py) -- it's a causal online estimate built only
-from the command the agent itself sent and the flow it measured back:
+(target - measured flow, and its step-to-step change). `pending_correction`
+is read directly from `env.plant.pending_correction()` -- the same
+ground-truth "how much commanded change hasn't reached the plant yet"
+feature IVInfusionEnv gives the tabular Q-learning agent through its
+discretized state, now that the plant has a `delay_steps`-step transport
+delay (see environment.py). It is legitimately available to RL agents (not
+PID) by the environment's own design, so DQN reads it the same way, not via
+an estimate. `k_eff_estimate` IS an estimate, because occlusion severity is
+never exposed to any controller (RL or PID) -- it's a causal online value
+built only from the command the agent itself sent and the flow it measured
+back:
 
     k_hat = clip(measured_flow / command, 0, 1.2), EMA-smoothed
 
@@ -98,13 +105,14 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-STATE_DIM = 3  # (error, error_rate, k_eff_estimate)
+STATE_DIM = 4  # (error, error_rate, pending_correction, k_eff_estimate)
 
 
-def _normalize_state(err, derr, k_hat, err_clip=60.0, derr_clip=15.0):
+def _normalize_state(err, derr, pending, k_hat, err_clip=60.0, derr_clip=15.0, pending_clip=40.0):
     return np.array([
         np.clip(err / err_clip, -3.0, 3.0),
         np.clip(derr / derr_clip, -3.0, 3.0),
+        np.clip(pending / pending_clip, -3.0, 3.0),
         k_hat,
     ], dtype=np.float32)
 
@@ -187,8 +195,9 @@ class DQNAgent:
 
 def run_dqn_episode(env, agent, k_eff_estimator=None, greedy=True):
     """Run one IVInfusionEnv episode with a DQN agent, using the continuous
-    (error, error-rate, k_eff-estimate) state instead of env's discretized
-    state index. Returns env.history (same schema PID/Q-learning produce).
+    (error, error-rate, pending-correction, k_eff-estimate) state instead of
+    env's discretized state index. Returns env.history (same schema
+    PID/Q-learning produce).
     """
     if k_eff_estimator is None:
         k_eff_estimator = KEffEstimator()
@@ -197,8 +206,9 @@ def run_dqn_episode(env, agent, k_eff_estimator=None, greedy=True):
     env.reset()
     err = env.target - env.plant.Q
     derr = 0.0
+    pending = env.plant.pending_correction()
     k_hat = k_eff_estimator.estimate
-    state = _normalize_state(err, derr, k_hat)
+    state = _normalize_state(err, derr, pending, k_hat, pending_clip=env.pending_clip)
 
     done = False
     total_r = 0.0
@@ -209,8 +219,9 @@ def run_dqn_episode(env, agent, k_eff_estimator=None, greedy=True):
         new_err = h["error"]
         derr = new_err - err
         err = new_err
+        pending = env.plant.pending_correction()
         k_hat = k_eff_estimator.update(h["command"], h["measured"])
-        next_state = _normalize_state(err, derr, k_hat)
+        next_state = _normalize_state(err, derr, pending, k_hat, pending_clip=env.pending_clip)
 
         if not greedy:
             agent.store(state, a, r, next_state, done)

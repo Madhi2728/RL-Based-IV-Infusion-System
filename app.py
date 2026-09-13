@@ -28,8 +28,9 @@ st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", l
 
 DT = 1.0
 EPISODE_LEN_DEFAULT = 180
-ERR_BINS, DERR_BINS = 21, 11
-ERR_CLIP, DERR_CLIP = 60.0, 15.0
+DELAY_STEPS = 10
+ERR_BINS, DERR_BINS, PENDING_BINS = 21, 11, 7
+ERR_CLIP, DERR_CLIP, PENDING_CLIP = 60.0, 15.0, 40.0
 N_ACTIONS = 7
 ACTIONS = np.array([-8, -4, -1, 0, 1, 4, 8], dtype=float)
 
@@ -56,15 +57,16 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
     return chart
 
 
-def discretize(err, derr):
+def discretize(err, derr, pending):
     e_idx = int(np.clip((err + ERR_CLIP) / (2 * ERR_CLIP) * ERR_BINS, 0, ERR_BINS - 1))
     de_idx = int(np.clip((derr + DERR_CLIP) / (2 * DERR_CLIP) * DERR_BINS, 0, DERR_BINS - 1))
-    return e_idx * DERR_BINS + de_idx
+    p_idx = int(np.clip((pending + PENDING_CLIP) / (2 * PENDING_CLIP) * PENDING_BINS, 0, PENDING_BINS - 1))
+    return (e_idx * DERR_BINS + de_idx) * PENDING_BINS + p_idx
 
 
 @st.cache_resource
 def load_qlearning_agent(path="results/qlearning_qtable.pkl"):
-    agent = QLearningAgent(ERR_BINS * DERR_BINS, N_ACTIONS)
+    agent = QLearningAgent(ERR_BINS * DERR_BINS * PENDING_BINS, N_ACTIONS)
     agent.load(path)
     return agent
 
@@ -85,7 +87,7 @@ class SimController:
 
     def __init__(self, kind, seed, start_flow, qlearning_agent=None, dqn_agent=None):
         self.kind = kind
-        self.plant = IVInfusionPlant(dt=DT, seed=seed)
+        self.plant = IVInfusionPlant(dt=DT, delay_steps=DELAY_STEPS, seed=seed)
         self.plant.reset(start_flow=start_flow)
         self.prev_err = 0.0
         self.k_eff_estimator = KEffEstimator()
@@ -101,17 +103,18 @@ class SimController:
     def step(self, target, k_eff, d_p):
         err = target - self.plant.Q
         derr = err - self.prev_err
+        pending = self.plant.pending_correction()
 
         if self.kind == "pid":
             u = self.pid.compute(err)
             self.plant.set_command(u)
         elif self.kind == "qlearning":
-            s = discretize(err, derr)
+            s = discretize(err, derr, pending)
             a = self.agent.select_action(s, greedy=True)
             self.plant.set_command(self.plant.u + ACTIONS[a])
         elif self.kind == "dqn":
             k_hat = self.k_eff_estimator.estimate
-            state = _normalize_state(err, derr, k_hat, ERR_CLIP, DERR_CLIP)
+            state = _normalize_state(err, derr, pending, k_hat, ERR_CLIP, DERR_CLIP, PENDING_CLIP)
             a = self.agent.select_action(state, greedy=True)
             self.plant.set_command(self.plant.u + ACTIONS[a])
 
