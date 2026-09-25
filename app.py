@@ -28,7 +28,7 @@ from src.dqn_agent import DQNAgent, KEffEstimator, _normalize_state
 st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", layout="wide")
 
 DT = 1.0
-EPISODE_LEN_DEFAULT = 180
+EPISODE_LEN_DEFAULT = 60
 DELAY_STEPS = 10
 ERR_BINS, DERR_BINS, PENDING_BINS = 21, 11, 7
 ERR_CLIP, DERR_CLIP, PENDING_CLIP = 60.0, 15.0, 40.0
@@ -59,7 +59,7 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
     return chart
 
 
-SPLASH_SECONDS = 5.0
+SPLASH_SECONDS = 3.0
 
 # Self-contained splash: inline SVG + CSS keyframes, no external assets.
 SPLASH_HTML = """
@@ -157,6 +157,18 @@ def batch_summary_table(batch):
     return pd.DataFrame(rows).round(2)
 
 
+# Plain-language row labels for the batch evaluation table, display only --
+# the underlying metric keys/values from src/evaluate.py are unchanged.
+METRIC_DISPLAY_LABELS = {
+    "IAE": "Total tracking error (IAE)",
+    "ISE": "Total error, big misses count more (ISE)",
+    "RMSE": "Typical error size, mL/hr (RMSE)",
+    "settling_time_s": "Time to stabilize, s",
+    "overshoot_pct": "Overshoot, %",
+    "pct_time_in_safe_band": "Time on-target, %",
+}
+
+
 def discretize(err, derr, pending):
     e_idx = int(np.clip((err + ERR_CLIP) / (2 * ERR_CLIP) * ERR_BINS, 0, ERR_BINS - 1))
     de_idx = int(np.clip((derr + DERR_CLIP) / (2 * DERR_CLIP) * DERR_BINS, 0, DERR_BINS - 1))
@@ -231,11 +243,11 @@ class SimController:
 
 def init_session(target, seed, episode_len, ql_agent, dqn_agent):
     start_flow = target * 0.5
-    controllers = {"PID": SimController("pid", seed, start_flow)}
+    controllers = {"PID (classic controller)": SimController("pid", seed, start_flow)}
     if ql_agent is not None:
-        controllers["Q-learning"] = SimController("qlearning", seed, start_flow, qlearning_agent=ql_agent)
+        controllers["Q-learning (RL)"] = SimController("qlearning", seed, start_flow, qlearning_agent=ql_agent)
     if dqn_agent is not None:
-        controllers["DQN"] = SimController("dqn", seed, start_flow, dqn_agent=dqn_agent)
+        controllers["DQN (RL)"] = SimController("dqn", seed, start_flow, dqn_agent=dqn_agent)
     st.session_state.controllers = controllers
     st.session_state.t = 0
     st.session_state.n_steps = int(episode_len / DT)
@@ -273,32 +285,46 @@ st.caption(
     "controllers. Trigger an occlusion mid-run and watch each one recover."
 )
 
-with st.expander("What am I looking at?"):
-    st.markdown(
-        "- **Random seed**: only fixes the sensor-noise realization, so the same seed "
-        "reproduces the exact same run. It does **not** change difficulty.\n"
-        "- **Occlusion severity (k_eff)**: **multiplicative** — scales how much of the "
-        "commanded flow actually reaches the patient (e.g. 0.4 = only 40% gets through). "
-        "Models a kinked line or positional occlusion against a vein wall. This attacks "
-        "the controller's *authority* over the line.\n"
-        "- **Occlusion duration**: how long that reduced k_eff persists before the line "
-        "clears back to k_eff = 1.0.\n"
-        "- **Pressure disturbance (d_p)**: **additive** — adds or subtracts flow "
-        "regardless of what's commanded. Models bag height changes, patient arm movement, "
-        "or venous back-pressure. This attacks the *output*, not the authority — even a "
-        "perfect command doesn't cancel it directly, the controller has to react to the "
-        "resulting error."
-    )
+if "auto_running" not in st.session_state:
+    st.session_state.auto_running = False
 
-col_play, col_auto = st.columns([1, 1])
-play = col_play.button("Play / Step")
-autoplay = col_auto.checkbox("Auto-run", value=False)
+st.markdown(
+    """
+    <style>
+    div.st-key-start_stop_controls button[kind="primary"] {
+        background-color: #d32f2f;
+        border-color: #d32f2f;
+        color: white;
+    }
+    div.st-key-start_stop_controls button[kind="primary"]:hover {
+        background-color: #b71c1c;
+        border-color: #b71c1c;
+        color: white;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+with st.container(key="start_stop_controls"):
+    col_start, col_stop = st.columns(2)
+    if col_start.button("START", type="primary", width="stretch"):
+        st.session_state.auto_running = True
+    if col_stop.button("STOP", type="primary", width="stretch"):
+        st.session_state.auto_running = False
 
 with st.sidebar:
     st.header("Setup")
     target_flow = st.slider("Target flow rate (mL/hr)", 50, 200, 100, step=5)
-    episode_len = st.slider("Episode length (s)", 60, 300, EPISODE_LEN_DEFAULT, step=10)
-    seed = st.number_input("Random seed (sensor noise)", value=0, step=1)
+    episode_len = st.slider(
+        "How long to simulate (seconds)", 60, 120, EPISODE_LEN_DEFAULT, step=10,
+        help="Episode length (s)",
+    )
+    seed = st.number_input(
+        "Repeat-test number", value=0, step=1,
+        help="Same number = identical random sensor noise, so you can compare "
+             "controllers fairly on the exact same run. Change it for a fresh "
+             "random run. (Random seed / sensor noise)",
+    )
 
     ql_available, dqn_available = True, True
     try:
@@ -321,25 +347,36 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Live disturbance")
-    occ_severity = st.slider("Occlusion severity (k_eff during event)", 0.0, 1.0, 0.4, step=0.05)
-    occ_duration = st.slider("Occlusion duration (s)", 5, 60, 20, step=5)
-    if st.button("Trigger occlusion now"):
+    occ_severity = st.slider(
+        "Line blockage severity", 0.0, 1.0, 0.4, step=0.05,
+        help="How blocked the IV line is during the event. 1.0 = fully open, "
+             "lower = more blocked (e.g. 0.4 = only 40% of the flow gets through). "
+             "(Occlusion severity / k_eff during event)",
+    )
+    occ_duration = st.slider(
+        "Blockage length (seconds)", 5, 60, 20, step=5,
+        help="How many seconds the line stays blocked before clearing. "
+             "(Occlusion duration)",
+    )
+    if st.button("Simulate a blocked line", help="Trigger occlusion now"):
         if "controllers" in st.session_state:
             st.session_state.occlusion_severity = occ_severity
             st.session_state.occlusion_until = st.session_state.t + occ_duration
 
-    pressure_bump = st.slider("Pressure disturbance d_p (mL/hr, applied now)", -25.0, 25.0, 0.0, step=1.0)
-    if st.button("Apply pressure bump"):
+    pressure_bump = st.slider(
+        "Bag height / arm-movement bump", -25.0, 25.0, 0.0, step=1.0,
+        help="Simulates raising/lowering the IV bag or the patient moving their "
+             "arm — pushes flow up or down directly, separate from any "
+             "blockage. (Pressure disturbance d_p, mL/hr, applied now)",
+    )
+    if st.button("Simulate bag/arm movement", help="Apply pressure bump"):
         if "controllers" in st.session_state:
             st.session_state.d_p = pressure_bump
 
 if "controllers" not in st.session_state:
     init_session(target_flow, int(seed), episode_len, ql_agent, dqn_agent)
 
-if play:
-    step_all()
-
-if autoplay and st.session_state.t < st.session_state.n_steps:
+if st.session_state.auto_running and st.session_state.t < st.session_state.n_steps:
     step_all()
 
 if st.session_state.rows:
@@ -350,16 +387,12 @@ if st.session_state.rows:
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
     st.altair_chart(flow_chart, width="stretch", key="flow_chart")
 
-    command_cols = [f"{name} command" for name in active_names]
-    command_chart = fixed_range_line_chart(df, command_cols, COMMAND_Y_DOMAIN, "Command (mL/hr)")
-    st.altair_chart(command_chart, width="stretch", key="command_chart")
-
     st.subheader("Running error stats (this episode so far)")
     abs_err = {name: (df["target"] - df[f"{name} flow"]).abs() for name in active_names}
     cols = st.columns(len(active_names))
     for col, name in zip(cols, active_names):
-        col.metric(f"{name} mean |error| (mL/hr)", f"{abs_err[name].mean():.2f}")
-        col.metric(f"{name} current flow (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
+        col.metric(f"{name}: average tracking error (mL/hr)", f"{abs_err[name].mean():.2f}")
+        col.metric(f"{name}: flow right now (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
 
     mean_errors = {name: float(e.mean()) for name, e in abs_err.items()}
     max_errors = {name: float(e.max()) for name, e in abs_err.items()}
@@ -369,19 +402,19 @@ if st.session_state.rows:
     best_max, best_max_val = best_by(max_errors)
     best_band, best_band_val = best_by(in_band, lower_is_better=False)
 
-    st.markdown(f"- **Best mean absolute error:** `{best_mean}` at {best_mean_val:.2f} mL/hr")
-    st.markdown(f"- **Best worst-case (max) absolute error:** `{best_max}` at {best_max_val:.2f} mL/hr")
-    st.markdown(f"- **Best time in +-{SAFE_BAND:.0f} mL/hr safe band:** `{best_band}` at {best_band_val:.1f}%")
+    st.markdown(f"- **Most accurate overall:** `{best_mean}` at {best_mean_val:.2f} mL/hr")
+    st.markdown(f"- **Best at avoiding big spikes:** `{best_max}` at {best_max_val:.2f} mL/hr")
+    st.markdown(f"- **Most time staying on-target (+-{SAFE_BAND:.0f} mL/hr):** `{best_band}` at {best_band_val:.1f}%")
 
     occ_window = last_occlusion_window(df["k_eff"])
     if occ_window is None:
-        st.markdown("- **Best recovery:** no occlusion triggered yet this episode")
+        st.markdown("- **Best at recovering from a blockage:** no occlusion triggered yet this episode")
     else:
         start, end = occ_window
         recovery = {name: float(e.iloc[start:end + 1].mean()) for name, e in abs_err.items()}
         best_recovery, best_recovery_val = best_by(recovery)
         st.markdown(
-            f"- **Best recovery** (mean absolute error during last occlusion, "
+            f"- **Best at recovering from a blockage** (mean absolute error during last occlusion, "
             f"t={df.index[start]}-{df.index[end]} s): "
             f"`{best_recovery}` at {best_recovery_val:.2f} mL/hr"
         )
@@ -401,18 +434,18 @@ if st.session_state.rows:
         )
     else:
         st.caption(
-            f"From `src/evaluate.py` over {batch['n_eval']} held-out eval-mode episodes. "
-            "Single-episode live numbers above are noisy; this batch result is the "
-            "statistically sound comparison. Lower is better for all rows except "
-            "% time in safe band."
+            f"Averaged over {batch['n_eval']} test runs with different random conditions "
+            "- this is the reliable comparison, since a single run can be noisy. Lower is "
+            "better for every row except time on-target."
         )
-        st.dataframe(batch_summary_table(batch), width="stretch")
+        table = batch_summary_table(batch).rename(index=METRIC_DISPLAY_LABELS)
+        st.dataframe(table, width="stretch")
 else:
     st.info("Click **Reset episode** in the sidebar to start.")
 
 st.caption(f"t = {st.session_state.get('t', 0)} / {st.session_state.get('n_steps', 0)} s   "
            f"current k_eff = {st.session_state.get('k_eff', 1.0):.2f}")
 
-if autoplay and st.session_state.t < st.session_state.n_steps:
+if st.session_state.auto_running and st.session_state.t < st.session_state.n_steps:
     time.sleep(0.05)
     st.rerun()
