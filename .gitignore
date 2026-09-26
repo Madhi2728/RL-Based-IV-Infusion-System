@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 *.pkl
 *.pt
+!results/qlearning_qtable.pkl
+!results/dqn_model.pt
