@@ -306,10 +306,6 @@ def step_all():
 show_splash_once()
 
 st.title("IV Infusion Flow Control: PID vs Q-learning vs DQN")
-st.caption(
-    "Same simulated line (src/environment.py), same disturbance schedule, three independent "
-    "controllers. Trigger an occlusion mid-run and watch each one recover."
-)
 
 if "auto_running" not in st.session_state:
     st.session_state.auto_running = False
