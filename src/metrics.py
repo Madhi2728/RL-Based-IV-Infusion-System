@@ -18,6 +18,8 @@ def compute_metrics(history, settle_band=5.0):
 
     iae = np.sum(np.abs(error)) * dt                 # integral of absolute error
     ise = np.sum(error ** 2) * dt                     # integral of squared error
+    itae = np.sum(t * np.abs(error)) * dt             # integral of time-weighted absolute error
+    itse = np.sum(t * error ** 2) * dt                # integral of time-weighted squared error
     rmse = float(np.sqrt(np.mean(error ** 2)))
 
     # settling time: first time after which |error| stays within settle_band
@@ -40,7 +42,7 @@ def compute_metrics(history, settle_band=5.0):
     pct_in_band = float(np.mean(np.abs(error) <= settle_band) * 100.0)
 
     return dict(
-        IAE=float(iae), ISE=float(ise), RMSE=rmse,
+        IAE=float(iae), ISE=float(ise), ITAE=float(itae), ITSE=float(itse), RMSE=rmse,
         settling_time_s=float(settle_time), overshoot_pct=float(overshoot_pct),
         pct_time_in_safe_band=pct_in_band,
     )

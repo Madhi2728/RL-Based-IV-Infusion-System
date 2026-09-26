@@ -115,22 +115,6 @@ def show_splash_once():
     st.session_state.splash_shown = True
 
 
-def last_occlusion_window(k_eff_series):
-    """Positional (start, end) bounds of the most recent contiguous run of
-    k_eff < 1 in the episode history, or None if no occlusion has occurred.
-    Includes an occlusion still in progress."""
-    occluded = (k_eff_series < 1.0).to_numpy()
-    if not occluded.any():
-        return None
-    end = len(occluded) - 1
-    while not occluded[end]:
-        end -= 1
-    start = end
-    while start > 0 and occluded[start - 1]:
-        start -= 1
-    return start, end
-
-
 def best_by(values, lower_is_better=True):
     """(label, value) of the winning controller(s). Ties are reported as ties
     rather than silently resolved by dict order, which would always favour
@@ -157,16 +141,17 @@ def batch_summary_table(batch):
     return pd.DataFrame(rows).round(2)
 
 
-# Plain-language row labels for the batch evaluation table, display only --
-# the underlying metric keys/values from src/evaluate.py are unchanged.
+# Plain-language row labels for the performance metrics table, display only --
+# the underlying metric keys/values from src/evaluate.py are unchanged. Only
+# these four metrics are shown in the table (see PERFORMANCE_METRIC_ROWS).
 METRIC_DISPLAY_LABELS = {
-    "IAE": "Total tracking error (IAE)",
-    "ISE": "Total error, big misses count more (ISE)",
-    "RMSE": "Typical error size, mL/hr (RMSE)",
-    "settling_time_s": "Time to stabilize, s",
-    "overshoot_pct": "Overshoot, %",
-    "pct_time_in_safe_band": "Time on-target, %",
+    "IAE": "Total Tracking Error (IAE)",
+    "ISE": "Total Error, Big Misses Count More (ISE)",
+    "ITAE": "Time-Weighted Tracking Error (ITAE)",
+    "ITSE": "Time-Weighted Big-Miss Error (ITSE)",
 }
+
+PERFORMANCE_METRIC_ROWS = ["IAE", "ISE", "ITAE", "ITSE"]
 
 
 def discretize(err, derr, pending):
@@ -306,10 +291,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 with st.container(key="start_stop_controls"):
-    col_start, col_stop = st.columns(2)
-    if col_start.button("START", type="primary", width="stretch"):
+    col_start, col_stop, _col_spacer = st.columns([1, 1, 4])
+    if col_start.button("START", type="primary"):
         st.session_state.auto_running = True
-    if col_stop.button("STOP", type="primary", width="stretch"):
+    if col_stop.button("STOP", type="primary"):
         st.session_state.auto_running = False
 
 with st.sidebar:
@@ -406,27 +391,13 @@ if st.session_state.rows:
     st.markdown(f"- **Best at avoiding big spikes:** `{best_max}` at {best_max_val:.2f} mL/hr")
     st.markdown(f"- **Most time staying on-target (+-{SAFE_BAND:.0f} mL/hr):** `{best_band}` at {best_band_val:.1f}%")
 
-    occ_window = last_occlusion_window(df["k_eff"])
-    if occ_window is None:
-        st.markdown("- **Best at recovering from a blockage:** no occlusion triggered yet this episode")
-    else:
-        start, end = occ_window
-        recovery = {name: float(e.iloc[start:end + 1].mean()) for name, e in abs_err.items()}
-        best_recovery, best_recovery_val = best_by(recovery)
-        st.markdown(
-            f"- **Best at recovering from a blockage** (mean absolute error during last occlusion, "
-            f"t={df.index[start]}-{df.index[end]} s): "
-            f"`{best_recovery}` at {best_recovery_val:.2f} mL/hr"
-        )
-
     st.caption(
         "Different metrics favour different controllers - mean error rewards steady "
-        "tracking, worst-case error rewards avoiding large excursions, recovery rewards "
-        "disturbance rejection."
+        "tracking, worst-case error rewards avoiding large excursions."
     )
 
     batch = load_batch_summary()
-    st.subheader("Batch evaluation (30 held-out episodes)")
+    st.subheader("Performance Metrics")
     if batch is None:
         st.info(
             "No batch summary found at `results/eval_summary.json` -- run "
@@ -438,7 +409,9 @@ if st.session_state.rows:
             "- this is the reliable comparison, since a single run can be noisy. Lower is "
             "better for every row except time on-target."
         )
-        table = batch_summary_table(batch).rename(index=METRIC_DISPLAY_LABELS)
+        table = batch_summary_table(batch)
+        table = table.reindex([r for r in PERFORMANCE_METRIC_ROWS if r in table.index])
+        table = table.rename(index=METRIC_DISPLAY_LABELS)
         st.dataframe(table, width="stretch")
 else:
     st.info("Click **Reset episode** in the sidebar to start.")
