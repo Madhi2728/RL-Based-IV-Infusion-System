@@ -59,6 +59,46 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
     return chart
 
 
+# Distinct dashed-line color + label per triggered disturbance event type,
+# drawn on the flow chart at the exact t it was triggered.
+EVENT_STYLE = {
+    "occlusion": {"color": "orange", "label": "Blockage"},
+    "pressure": {"color": "purple", "label": "Bag/arm bump"},
+}
+
+
+def add_event_markers(line_chart, events):
+    """Layers a vertical dashed rule + text label onto `line_chart` for each
+    triggered event (occlusion/pressure), at its exact trigger time `t`.
+    Purely visual annotation -- does not touch the underlying data/series."""
+    if not events:
+        return line_chart
+
+    ev_df = pd.DataFrame(events)
+    ev_df["color"] = ev_df["type"].map(lambda k: EVENT_STYLE[k]["color"])
+    ev_df["label"] = ev_df["type"].map(lambda k: EVENT_STYLE[k]["label"])
+
+    rules = (
+        alt.Chart(ev_df)
+        .mark_rule(strokeDash=[5, 4], size=2)
+        .encode(
+            x=alt.X("t:Q"),
+            color=alt.Color("color:N", scale=None, legend=None),
+        )
+    )
+    labels = (
+        alt.Chart(ev_df)
+        .mark_text(align="left", baseline="top", dx=4, dy=2, fontSize=11, fontWeight="bold")
+        .encode(
+            x=alt.X("t:Q"),
+            y=alt.value(4),
+            text="label:N",
+            color=alt.Color("color:N", scale=None, legend=None),
+        )
+    )
+    return alt.layer(line_chart, rules, labels).resolve_scale(color="independent")
+
+
 SPLASH_SECONDS = 3.0
 
 # Self-contained splash: inline SVG + CSS keyframes, no external assets.
@@ -243,6 +283,7 @@ def init_session(target, seed, episode_len, ql_agent, dqn_agent):
     st.session_state.occlusion_severity = 0.5
     st.session_state.rows = []
     st.session_state.running = False
+    st.session_state.events = []
 
 
 def step_all():
@@ -347,6 +388,7 @@ with st.sidebar:
         if "controllers" in st.session_state:
             st.session_state.occlusion_severity = occ_severity
             st.session_state.occlusion_until = st.session_state.t + occ_duration
+            st.session_state.events.append({"t": st.session_state.t, "type": "occlusion"})
 
     pressure_bump = st.slider(
         "Bag height / arm-movement bump", -25.0, 25.0, 0.0, step=1.0,
@@ -357,6 +399,7 @@ with st.sidebar:
     if st.button("Simulate bag/arm movement", help="Apply pressure bump"):
         if "controllers" in st.session_state:
             st.session_state.d_p = pressure_bump
+            st.session_state.events.append({"t": st.session_state.t, "type": "pressure"})
 
 if "controllers" not in st.session_state:
     init_session(target_flow, int(seed), episode_len, ql_agent, dqn_agent)
@@ -370,6 +413,7 @@ if st.session_state.rows:
 
     flow_cols = ["target"] + [f"{name} flow" for name in active_names]
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
+    flow_chart = add_event_markers(flow_chart, st.session_state.get("events", []))
     st.altair_chart(flow_chart, width="stretch", key="flow_chart")
 
     st.subheader("Running error stats (this episode so far)")
