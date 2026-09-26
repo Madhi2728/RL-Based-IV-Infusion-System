@@ -342,7 +342,7 @@ with st.sidebar:
     st.header("Setup")
     target_flow = st.slider("Target flow rate (mL/hr)", 50, 200, 100, step=5)
     episode_len = st.slider(
-        "How long to simulate (seconds)", 60, 120, EPISODE_LEN_DEFAULT, step=10,
+        "How long to simulate (seconds)", 50, 200, EPISODE_LEN_DEFAULT, step=10,
         help="Episode length (s)",
     )
     seed = st.number_input(
