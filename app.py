@@ -342,7 +342,7 @@ with st.sidebar:
     st.header("Setup")
     target_flow = st.slider("Target flow rate (mL/hr)", 50, 200, 100, step=5)
     episode_len = st.slider(
-        "How long to simulate (seconds)", 50, 200, EPISODE_LEN_DEFAULT, step=10,
+        "Episode length", 50, 200, EPISODE_LEN_DEFAULT, step=10,
         help="Episode length (s)",
     )
     seed = st.number_input(
@@ -374,7 +374,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Live disturbance")
     occ_severity = st.slider(
-        "Line blockage severity", 0.0, 1.0, 0.4, step=0.05,
+        "Line blockage severity", 0.0, 1.0, 0.5, step=0.05,
         help="How blocked the IV line is during the event. 1.0 = fully open, "
              "lower = more blocked (e.g. 0.4 = only 40% of the flow gets through). "
              "(Occlusion severity / k_eff during event)",
@@ -384,19 +384,37 @@ with st.sidebar:
         help="How many seconds the line stays blocked before clearing. "
              "(Occlusion duration)",
     )
-    if st.button("Simulate a blocked line", help="Trigger occlusion now"):
+    if st.button("Simulate a blockage in the flow", help="Trigger occlusion now"):
         if "controllers" in st.session_state:
             st.session_state.occlusion_severity = occ_severity
             st.session_state.occlusion_until = st.session_state.t + occ_duration
             st.session_state.events.append({"t": st.session_state.t, "type": "occlusion"})
 
-    pressure_bump = st.slider(
-        "Bag height / arm-movement bump", -25.0, 25.0, 0.0, step=1.0,
-        help="Simulates raising/lowering the IV bag or the patient moving their "
-             "arm — pushes flow up or down directly, separate from any "
-             "blockage. (Pressure disturbance d_p, mL/hr, applied now)",
+    bag_height_cm = st.slider(
+        "Bag height", 1, 100, 50, step=1,
+        help="Height of the IV bag above the patient's arm, in cm. 50 cm is "
+             "the neutral baseline (no extra pressure). Raising or lowering "
+             "it pushes flow up or down, separate from any blockage. "
+             "(Converted to pressure disturbance d_p, mL/hr, applied now)",
     )
-    if st.button("Simulate bag/arm movement", help="Apply pressure bump"):
+    # UI-only unit-conversion layer: maps the physically-flavored "bag height"
+    # input (cm) onto the existing pressure-disturbance quantity d_p (mL/hr)
+    # that the simulation actually consumes. 50cm is the neutral baseline
+    # (d_p = 0); linear from there to each end of the slider range so
+    # 1cm -> -25 mL/hr and 100cm -> +25 mL/hr, matching the old direct
+    # -25..25 mL/hr slider's range. The simulation/controller logic itself
+    # is untouched -- only how d_p is derived from the sidebar input changes.
+    BAG_HEIGHT_BASELINE_CM = 50
+    BAG_HEIGHT_MIN_CM, BAG_HEIGHT_MAX_CM = 1, 100
+    PRESSURE_BUMP_RANGE = 25.0  # mL/hr, same magnitude as the old slider
+    if bag_height_cm >= BAG_HEIGHT_BASELINE_CM:
+        pressure_bump = ((bag_height_cm - BAG_HEIGHT_BASELINE_CM)
+                          / (BAG_HEIGHT_MAX_CM - BAG_HEIGHT_BASELINE_CM) * PRESSURE_BUMP_RANGE)
+    else:
+        pressure_bump = ((bag_height_cm - BAG_HEIGHT_BASELINE_CM)
+                          / (BAG_HEIGHT_BASELINE_CM - BAG_HEIGHT_MIN_CM) * PRESSURE_BUMP_RANGE)
+
+    if st.button("Simulate a bag or arm movement", help="Apply pressure bump"):
         if "controllers" in st.session_state:
             st.session_state.d_p = pressure_bump
             st.session_state.events.append({"t": st.session_state.t, "type": "pressure"})
