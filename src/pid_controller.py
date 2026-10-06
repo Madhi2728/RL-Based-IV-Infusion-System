@@ -1,6 +1,14 @@
 """
 pid_controller.py
 ------------------
+
+PID law (discrete, per compute(error)):
+    u = Kp*e + Ki*integral(e dt) + Kd*de/dt
+    integral   = clamp(integral + e*dt, -integral_limit, +integral_limit)  (anti-windup)
+    derivative = (e - e_prev) / dt
+    output     = clamp(u, u_min, u_max)
+Defaults (constructor): Kp=0.6  Ki=0.08  Kd=0.2  dt=1.0
+    u_min=0.0  u_max=400.0  integral_limit=1500.0
 Conventional PID controller used as the baseline against the Q-learning agent.
 Operates on the same error signal (target - measured flow) and outputs a
 pump command adjustment, so it can be dropped into the same environment loop.
@@ -10,6 +18,20 @@ u(t) = Kp*e(t) + Ki*integral(e) + Kd*de/dt   (with integral anti-windup clamp)
 
 
 class PIDController:
+    """Discrete-time PID controller with integral anti-windup.
+
+    Mathematical model (per compute(error), dt seconds per call):
+
+        integral   = clip(integral + error * dt, -integral_limit, integral_limit)
+        derivative = (error - prev_error) / dt
+        u          = Kp * error + Ki * integral + Kd * derivative
+        u          = clip(u, u_min, u_max)
+
+      Anti-windup: the integral term is clamped to [-integral_limit,
+      integral_limit] before being used, preventing it from growing
+      unbounded while the output is saturated at u_min/u_max.
+    """
+
     def __init__(self, kp=0.6, ki=0.08, kd=0.2, dt=1.0, u_min=0.0, u_max=400.0,
                  integral_limit=1500.0):
         self.kp, self.ki, self.kd = kp, ki, kd

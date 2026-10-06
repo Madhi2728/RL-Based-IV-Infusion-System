@@ -1,6 +1,11 @@
 """
 train.py
 --------
+
+Settings: 3000 episodes (default), seed 0 (default), episode_len 180 (env default).
+Trains: the tabular Q-learning agent ONLY (PID has no training; DQN is trained
+        separately via `python -m src.dqn_agent`).
+Saves : results/qlearning_qtable.pkl and results/qlearning_training_curve.png
 Trains the tabular Q-learning agent on IVInfusionEnv over many randomized
 episodes (random target flow rates, random occlusion/pressure disturbances),
 then saves the learned Q-table and a training-reward curve.

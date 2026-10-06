@@ -1,6 +1,12 @@
 """
 app.py
 ------
+
+Dashboard: steps PID, Q-learning and DQN forward live on one chart.
+Q-table (results/qlearning_qtable.pkl) and DQN weights (results/dqn_model.pt)
+are frozen: loaded from results/, never trained or updated here.
+PID, Q and DQN all run on the same simulated line (IVInfusionPlant, delay_steps=10).
+Batch metrics shown come from results/eval_summary.json.
 Streamlit app: live side-by-side comparison of PID, tabular Q-learning, and
 DQN control of the simulated IV infusion line (src/environment.py).
 

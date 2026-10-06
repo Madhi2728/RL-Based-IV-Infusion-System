@@ -1,6 +1,15 @@
 """
 metrics.py
 ----------
+
+Metrics (e = target - measured, t = time, dt = step):
+  IAE   = sum(|e|) * dt            ISE  = sum(e^2) * dt
+  ITAE  = sum(t * |e|) * dt        ITSE = sum(t * e^2) * dt
+  RMSE  = sqrt(mean(e^2))
+  settling time = first t after which |e| <= settle_band (5.0 mL/hr) for the
+                  rest of the episode (episode end if it never settles)
+  overshoot %   = max(0, (max(measured) - first_target) / first_target * 100)
+  % time in safe band = mean(|e| <= settle_band) * 100   (settle_band=5.0)
 Standard control-engineering metrics computed from an episode history
 (list of dicts with keys: t, target, measured, error), used to compare
 the Q-learning agent against the PID baseline on equal footing.

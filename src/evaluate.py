@@ -1,6 +1,17 @@
 """
 evaluate.py
 -----------
+
+Eval episodes: --n_eval, default 20 (eval seeds 10000 + i), mode="eval".
+Controllers  : Q-learning, PID (Kp=0.6 Ki=0.08 Kd=0.2), and DQN only when
+               --dqn_model is given.
+Metrics (src/metrics.py; e = target - measured, settle_band = 5.0 mL/hr):
+  IAE = sum|e|*dt      ISE = sum e^2*dt      ITAE = sum t|e|*dt
+  ITSE = sum t e^2*dt  RMSE = sqrt(mean e^2)
+  settling time = first t after which |e| stays <= 5.0 to episode end
+  overshoot % = (max(measured) - first_target) / first_target * 100, floored at 0
+  % time in safe band = mean(|e| <= 5.0) * 100
+Reports mean +/- std over episodes; writes results/eval_summary.json.
 Evaluates the trained Q-learning policy AND a PID baseline on the same set of
 evaluation episodes. Evaluation episodes use `mode="eval"` in the
 DisturbanceScheduler, which draws occlusion severity/timing and pressure-bump

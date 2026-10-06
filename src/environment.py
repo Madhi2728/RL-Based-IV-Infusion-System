@@ -1,6 +1,38 @@
 """
 environment.py
 ---------------
+
+MODEL: IV infusion line (pump + tube), NOT veins
+================================================
+Plant (Euler, dt per step):   tau * dQ/dt = k_eff * u_applied - Q + d_p
+  Q         = delivered flow, mL/hr
+  u_applied = pump command after transport delay
+  k_eff     = blockage factor (1.0 = clear, lower = kinked/blocked)
+  d_p       = pressure / bag-height / arm disturbance
+Delay:  u_applied(t) = u(t - delay_steps)
+Venous back-pressure is modelled only as the lumped disturbance d_p.
+
+Plant parameters (IVInfusionPlant defaults)
+  tau=8.0  dt=1.0  u_max=400.0  q_max=500.0  noise_std=0.5  delay_steps=6
+  NOTE: IVInfusionEnv builds the plant with delay_steps=10 (env default).
+
+Disturbances (DisturbanceScheduler)        TRAIN          EVAL
+  k_eff range during an occlusion          0.35 - 0.85    0.15 - 0.75
+  number of occlusions                     0 - 2          1 - 3
+  pressure amplitude (d_p bump, +/-)       15.0           25.0
+  (1-2 gaussian d_p bumps per episode; occlusion lasts >= 5 steps)
+
+RL environment (IVInfusionEnv)
+  state   = (error, error-rate, pending_correction = u - u_applied)
+  bins    = 21 x 11 x 7 = 1617 states
+  clips   = |error| 60.0, |error-rate| 15.0, |pending| 40.0
+  actions = [-8, -4, -1, 0, +1, +4, +8] mL/hr added to command (7 actions)
+  episode = 180 steps (episode_len=180.0, dt=1.0)
+  target  = uniform(50, 200) mL/hr, 0 or 1 mid-episode change
+            (change step in [20, n_steps))
+  reward  = -|e|/20 - 0.02*|du| - 0.15*max(0, |e| - safe_band)
+            + 0.5 if |e| < tight_band
+  safe_band = 5.0 mL/hr     tight_band = 1.5 mL/hr
 Mathematical simulation of a simulated IV infusion flow process, wrapped as an
 RL environment (Gym-style API: reset() / step()) for a tabular Q-learning agent.
 
@@ -21,7 +53,7 @@ experiences:
                (bag height changes, patient arm movement, venous back-pressure)
 
 Disturbances modeled:
-  1. Partial occlusion: K_eff drops (e.g. to 0.4-0.8) for a random window,
+  1. Partial occlusion: K_eff drops (train 0.35-0.85, eval 0.15-0.75) for a random window,
      representing a kink or positional occlusion.
   2. Full/near-full occlusion spike: K_eff drops sharply and briefly (alarm-
      worthy event), tests robustness.
@@ -61,7 +93,31 @@ import numpy as np
 
 
 class IVInfusionPlant:
-    """Continuous-time plant dynamics, Euler-integrated, with transport delay."""
+    """Continuous-time plant dynamics, Euler-integrated, with transport delay.
+
+    Mathematical model:
+
+        tau * dQ/dt = k_eff * u_applied - Q + d_p
+
+      where Q is the actual delivered flow, u_applied is the pump command
+      after passing through the transport delay line, k_eff is the effective
+      line gain (1.0 = clear line, <1 = occlusion), and d_p is the additive
+      hydrostatic/back-pressure disturbance.
+
+    Euler update (per step(), dt seconds per step):
+
+        dQ        = (k_eff * u_applied - Q + d_p) / tau
+        Q(t+dt)   = clip(Q(t) + dt * dQ, 0, q_max)
+        measured  = clip(Q(t+dt) + N(0, noise_std), 0, q_max)
+
+    Transport delay:
+
+        u_applied(t) = u(t - delay_steps * dt)
+
+      implemented as a FIFO queue of length delay_steps: each step() pushes
+      the latest command u and pops the command issued delay_steps steps ago
+      to use as u_applied in the ODE above.
+    """
 
     def __init__(self, tau=8.0, dt=1.0, u_max=400.0, q_max=500.0, noise_std=0.5,
                  delay_steps=6, seed=None):
@@ -223,7 +279,7 @@ class IVInfusionEnv:
 
     # ---------- target profile ----------
     def _sample_target_profile(self):
-        """Piecewise-constant target flow rate, changes 1-2 times per episode."""
+        """Piecewise-constant target flow rate, changes 0 or 1 times per episode."""
         n_changes = self.rng.integers(0, 2)
         targets = [self.rng.uniform(50, 200)]
         change_points = sorted(self.rng.choice(range(20, self.n_steps), size=n_changes, replace=False)) \

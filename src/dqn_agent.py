@@ -1,6 +1,17 @@
 """
 dqn_agent.py
 ------------
+
+What is implemented (standard DQN, nothing missing):
+  Network : Linear(4 -> 64) ReLU, Linear(64 -> 64) ReLU, Linear(64 -> n_actions)
+            input = state vector (error, error-rate, pending, k_eff_estimate),
+            output = one Q-value per action
+  Loss    : MSE (not Huber), y = r + gamma * max_a' Q_target(s',a') * (1 - done)
+  Replay  : ReplayBuffer, capacity 50,000, uniform sampling, batch_size 64
+  Target  : separate target net, hard copy from policy net every 500 train_steps
+  Optim   : Adam, lr=1e-3; one gradient step per env step (no gradient clipping)
+  Policy  : epsilon-greedy, eps_start=1.0 eps_end=0.05 eps_decay=0.995 per episode
+  gamma   = 0.95
 DQN agent (PyTorch) for IV infusion flow control, using the same
 IVInfusionEnv/reward as the tabular Q-learning agent and PID baseline, but
 operating on a continuous state representation instead of the env's
@@ -72,6 +83,18 @@ class KEffEstimator:
 
 
 class QNetwork(nn.Module):
+    """Feedforward Q-network: state -> per-action Q-values.
+
+    Architecture (this module's default hidden=64):
+
+        Linear(state_dim -> hidden) -> ReLU
+        Linear(hidden -> hidden)    -> ReLU
+        Linear(hidden -> n_actions)
+
+      i.e. 2 hidden layers of width `hidden` with ReLU activations, and a
+      final linear layer producing one Q-value per action (no activation).
+    """
+
     def __init__(self, state_dim, n_actions, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
@@ -87,6 +110,14 @@ class QNetwork(nn.Module):
 
 
 class ReplayBuffer:
+    """Fixed-capacity FIFO experience replay buffer (default capacity=50,000).
+
+    Stores (s, a, r, s_next, done) transitions in a deque; once full, each
+    push() evicts the oldest transition. sample(batch_size) draws a uniform
+    random batch without replacement (default batch_size=64, set by
+    DQNAgent) for train_step().
+    """
+
     def __init__(self, capacity=50_000, seed=None):
         self.buffer = deque(maxlen=capacity)
         self.rng = random.Random(seed)
@@ -118,6 +149,38 @@ def _normalize_state(err, derr, pending, k_hat, err_clip=60.0, derr_clip=15.0, p
 
 
 class DQNAgent:
+    """DQN agent: QNetwork policy/target pair trained with experience replay.
+
+    Network: two QNetwork instances (policy_net, target_net), each with the
+    2-hidden-layer-of-64-with-ReLU architecture described in QNetwork's
+    docstring (state_dim=4, hidden=64 by default). target_net starts as a
+    copy of policy_net's weights and is not updated by gradient descent.
+
+    TD target (per train_step(), using gamma=0.95 by default):
+
+        y = r + gamma * max_a' Q_target(s', a') * (1 - done)
+
+      i.e. the bootstrapped target is just r when done=1, using target_net
+      (not policy_net) to evaluate s' -- this is what makes it DQN rather
+      than plain online Q-learning with a function approximator.
+
+    Loss: mean-squared error between the policy network's Q(s,a) for the
+    taken action and the TD target y:
+
+        loss = MSE( Q_policy(s, a), y )
+
+      optimized with Adam (lr=1e-3 by default) via one gradient step per
+      train_step() call.
+
+    Replay buffer: ReplayBuffer with capacity=50,000 (buffer_capacity
+    default), sampled in batches of batch_size=64 (default) once the buffer
+    holds at least batch_size transitions.
+
+    Target network sync: every target_sync_every=500 (default) calls to
+    train_step(), target_net's weights are hard-copied from policy_net
+    (load_state_dict), rather than any soft/Polyak update.
+    """
+
     def __init__(self, n_actions, state_dim=STATE_DIM, hidden=64, lr=1e-3,
                  gamma=0.95, eps_start=1.0, eps_end=0.05, eps_decay=0.995,
                  buffer_capacity=50_000, batch_size=64, target_sync_every=500,
