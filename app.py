@@ -466,7 +466,7 @@ def pf_bis_chart(df, names, events):
         .encode(y=alt.Y("lo:Q", scale=alt.Scale(domain=list(PF_BIS_Y_DOMAIN))), y2="hi:Q")
     )
     lines = pf_line_chart(df, ["target"] + [f"{n} BIS" for n in names], PF_BIS_Y_DOMAIN,
-                          "BIS (40-60 safe band shaded)", rename_suffix=" BIS")
+                          "BIS (0-100)", rename_suffix=" BIS")
     return add_event_markers(alt.layer(band, lines), events)
 
 
@@ -567,23 +567,28 @@ def render_propofol_dashboard():
         names = list(ss.pf_controllers.keys())
         events = ss.get("pf_events", [])
 
+        st.subheader("Graph 1 - BIS (Depth of Anesthesia) vs Time")
+        st.caption(f"Main result. The closer a controller's line stays to the target "
+                   f"({ss.pf_target:.0f}) and inside the 40-60 band, the better.")
         st.altair_chart(pf_bis_chart(df, names, events), width="stretch", key="pf_bis_chart")
-        st.subheader("Effect-site concentration (Ce)")
+        st.subheader("Graph 2 - Effect-Site Concentration (Ce) vs Time")
+        st.caption("Drug concentration at the brain. BIS follows this curve with a delay.")
         ce_chart = pf_line_chart(df, [f"{n} Ce" for n in names], PF_CE_Y_DOMAIN, "Ce (ug/mL)",
                                  rename_suffix=" Ce")
         st.altair_chart(add_event_markers(ce_chart, events), width="stretch", key="pf_ce_chart")
-        st.subheader("Infusion rate")
+        st.subheader("Graph 3 - Propofol Infusion Rate vs Time")
+        st.caption("The control action. Smooth is better, constant spikes mean unstable control.")
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
-                                   "Propofol infusion (mg/kg/h)", rename_suffix=" rate")
+                                   "Infusion (mg/kg/h)", rename_suffix=" rate")
         st.altair_chart(add_event_markers(rate_chart, events), width="stretch", key="pf_rate_chart")
 
-        st.subheader("Metrics (this episode so far)")
+        st.subheader("Table 1 - Performance Metrics (this episode)")
+        st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
+                   "total propofol.")
         st.dataframe(pf_live_metrics(ss), width="stretch")
-        st.caption("Lower is better for every row except time in target; total propofol "
-                   "is context, not a score.")
 
         batch = load_batch_summary(PF_SUMMARY_PATH)
-        st.subheader("Performance Metrics (batch evaluation)")
+        st.subheader("Table 2 - Performance Metrics (batch evaluation)")
         if batch is None:
             st.info(f"No batch summary found at `{PF_SUMMARY_PATH}` -- run "
                     "`python -m src.propofol_evaluate --n_eval 50` to generate it.")
@@ -734,6 +739,9 @@ if st.session_state.rows:
     df = pd.DataFrame(st.session_state.rows).set_index("t")
     active_names = list(st.session_state.controllers.keys())
 
+    st.subheader("Graph 1 - Flow Rate vs Time (controller comparison)")
+    st.caption("Main result. The closer a controller's line stays to the target flow, the better; "
+               "dashed markers show triggered blockages / bag movements.")
     flow_cols = ["target"] + [f"{name} flow" for name in active_names]
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
     flow_chart = add_event_markers(flow_chart, st.session_state.get("events", []))
@@ -764,7 +772,7 @@ if st.session_state.rows:
     )
 
     batch = load_batch_summary()
-    st.subheader("Performance Metrics")
+    st.subheader("Table 1 - Performance Metrics")
     if batch is None:
         st.info(
             "No batch summary found at `results/eval_summary.json` -- run "
