@@ -8,7 +8,8 @@ Trains RL agents on PropofolEnv (src/propofol_environment.py), mode="train".
                       default 3000 episodes
   --agent dqn       : DQNAgent(8 actions, state_dim=PROPOFOL_STATE_DIM=7) on
                       env.continuous_state(); same QNetwork/ReplayBuffer/DQN
-                      defaults as src/dqn_agent.py; default 600 episodes
+                      defaults as src/dqn_agent.py; one gradient step every
+                      4 env steps (DQN_TRAIN_EVERY); default 600 episodes
   episode = 720 steps (60 min at dt=5 s)
 Both agents are reused unchanged from src/q_learning_agent.py / src/dqn_agent.py.
 Bootstrapping: the TD target is cut only on a TRUE termination (BIS < 20,
@@ -30,12 +31,17 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import torch
 
 from src.propofol_environment import PropofolEnv, PROPOFOL_STATE_DIM
 from src.q_learning_agent import QLearningAgent
 from src.dqn_agent import DQNAgent
 
 DEFAULT_EPISODES = {"qlearning": 3000, "dqn": 600}
+# One DQN gradient step per 4 env steps (standard DQN "update every 4"): 5-s
+# propofol transitions are highly correlated, and a 720-step episode with a
+# gradient step per env step is ~4x slower for little gain.
+DQN_TRAIN_EVERY = 4
 
 
 def run_qlearning_episode(env, agent, greedy=True):
@@ -53,8 +59,10 @@ def run_qlearning_episode(env, agent, greedy=True):
     return env.history, total_r
 
 
-def run_dqn_episode(env, agent, greedy=True):
-    """One PropofolEnv episode with DQN on env.continuous_state() (learns unless greedy)."""
+def run_dqn_episode(env, agent, greedy=True, train_every=DQN_TRAIN_EVERY):
+    """One PropofolEnv episode with DQN on env.continuous_state() (learns unless
+    greedy). Every transition is stored; one gradient step every `train_every`
+    env steps."""
     env.reset()
     state = env.continuous_state()
     done = False
@@ -65,7 +73,8 @@ def run_dqn_episode(env, agent, greedy=True):
         next_state = env.continuous_state()
         if not greedy:
             agent.store(state, a, r, next_state, info["terminated"])
-            agent.train_step()
+            if env.step_idx % train_every == 0:
+                agent.train_step()
         state = next_state
         total_r += r
     return env.history, total_r
@@ -97,6 +106,9 @@ def train(agent_kind="qlearning", n_episodes=None, seed=0, out_dir="results", lo
         agent = QLearningAgent(env.n_states, env.n_actions, seed=seed)
         run = run_qlearning_episode
     elif agent_kind == "dqn":
+        # the tiny 7-64-64-8 MLP is faster single-threaded (thread overhead
+        # dominates at batch 64); speed only, results are unaffected
+        torch.set_num_threads(1)
         agent = make_dqn_agent(env.n_actions, seed=seed)
         run = run_dqn_episode
     else:
