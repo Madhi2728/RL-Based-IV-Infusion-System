@@ -4,9 +4,11 @@ propofol_evaluate.py
 
 Eval episodes: --n_eval, default 50 (eval seeds 20000 + i), PropofolEnv mode="eval"
                (random patient age 20-80 / 50-110 kg / 150-195 cm / M-F, Ce50
-               +/-25 %, gamma +/-20 %, 3-4 stimuli of +20-30 % Ce50, 3-5 min).
-Controllers  : PID (TUNED_PID_GAINS from src/propofol_pid_tune.py, tuned on the
-               nominal patient only), Q-learning (--qtable), DQN (--dqn_model);
+               +/-15 %, gamma +/-20 %, 3-4 stimuli of +20-30 % Ce50, 3-5 min).
+Controllers  : cascade PID (CascadePID + TUNED_PID_GAINS from src/propofol_pid_tune.py, tuned on the
+               nominal patient only), Q-learning (--qtable, default
+               results/propofol_v2_qlearning_qtable.pkl), DQN (--dqn_model, default
+               results/propofol_v2_dqn_model.pt);
                an RL controller whose file is missing is skipped with a warning.
 Fairness     : each controller gets its own PropofolEnv(seed=20000+i, "eval");
                the per-episode seed streams make the patient, PD jitter, stimulus
@@ -41,7 +43,7 @@ import matplotlib.pyplot as plt
 from src.propofol_environment import PropofolEnv
 from src.propofol_metrics import compute_propofol_metrics
 from src.propofol_pid_tune import TUNED_PID_GAINS, run_pid_episode
-from src.propofol_train import make_dqn_agent, run_dqn_episode, run_qlearning_episode
+from src.propofol_train import MODEL_PATHS, make_dqn_agent, run_dqn_episode, run_qlearning_episode
 from src.q_learning_agent import QLearningAgent
 
 EVAL_SEED_BASE = 20_000
@@ -83,8 +85,8 @@ def build_controllers(qtable_path, dqn_model_path):
     return controllers
 
 
-def evaluate(n_eval=50, qtable_path="results/propofol_qlearning_qtable.pkl",
-             dqn_model_path="results/propofol_dqn_model.pt", out_prefix="results/propofol_eval"):
+def evaluate(n_eval=50, qtable_path=MODEL_PATHS["qlearning"],
+             dqn_model_path=MODEL_PATHS["dqn"], out_prefix="results/propofol_eval"):
     controllers = build_controllers(qtable_path, dqn_model_path)
     rows, examples, example_env = [], {}, None
 
@@ -150,9 +152,9 @@ def _plot_traces(examples, env, out_prefix):
         ax.plot(t, [h["measured"] for h in hist], color=COLORS.get(name), lw=1, label="measured BIS")
         _shade_stimuli(ax, env)
         ax2 = ax.twinx()
-        ax2.step(t, [h["rate_mg_kg_h"] for h in hist], where="post", color="grey", alpha=0.6, lw=0.8)
+        ax2.step(t, [h["command"] for h in hist], where="post", color="grey", alpha=0.6, lw=0.8)
         ax2.set_ylabel("rate (mg/kg/h)")
-        ax2.set_ylim(0, 13)
+        ax2.set_ylim(0, 42)
         ax.set_ylim(0, 100)
         ax.set_ylabel("BIS")
         ax.set_title(f"{name} - example eval episode")
@@ -199,8 +201,8 @@ def _plot_bars(df, names, out_prefix):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_eval", type=int, default=50)
-    parser.add_argument("--qtable", type=str, default="results/propofol_qlearning_qtable.pkl")
-    parser.add_argument("--dqn_model", type=str, default="results/propofol_dqn_model.pt")
+    parser.add_argument("--qtable", type=str, default=MODEL_PATHS["qlearning"])
+    parser.add_argument("--dqn_model", type=str, default=MODEL_PATHS["dqn"])
     parser.add_argument("--out_prefix", type=str, default="results/propofol_eval")
     args = parser.parse_args()
     evaluate(n_eval=args.n_eval, qtable_path=args.qtable, dqn_model_path=args.dqn_model,

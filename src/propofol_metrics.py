@@ -18,7 +18,9 @@ Metrics for PropofolEnv episodes (e = target_BIS - measured_BIS, dt = 5 s):
                          the change until |e| <= 5 holds for 12 consecutive
                          steps, censored at the end of that target segment
     total_propofol_mg  = sum(u_mg_per_s * dt)
-    mean_rate_mg_kg_h  = mean commanded infusion over the steps actually run
+    total_propofol_mg includes boluses; bolus_mg = bolus part alone
+    mean_rate_mg_kg_h  = mean commanded infusion (excluding boluses) over the
+                         steps actually run
     terminated_early   = 1.0 if the episode ended on BIS < 20
 
 Early-terminated episodes are padded to the full horizon by holding the last
@@ -43,7 +45,7 @@ def pad_history(history, n_steps, dt):
     last = history[-1]
     for k in range(len(history), n_steps):
         row = dict(last)
-        row.update(t=k * dt, rate_mg_kg_h=0.0, rate_mg_s=0.0, command=0.0, padded=True)
+        row.update(t=k * dt, rate_mg_kg_h=0.0, rate_mg_s=0.0, command=0.0, bolus_mg=0.0, padded=True)
         padded.append(row)
     return padded
 
@@ -89,6 +91,7 @@ def compute_propofol_metrics(history, change_steps, n_steps, dt=5.0, band=5.0):
         induction_time_s=float(induction_time),
         settling_time_s=settling,
         total_propofol_mg=float(sum(h["rate_mg_s"] for h in history) * dt),
-        mean_rate_mg_kg_h=float(np.mean([h["rate_mg_kg_h"] for h in history])) if history else 0.0,
+        mean_rate_mg_kg_h=float(np.mean([h["command"] for h in history])) if history else 0.0,
+        bolus_mg=float(sum(h.get("bolus_mg", 0.0) for h in history)),
         terminated_early=float(len(history) < n_steps),
     )

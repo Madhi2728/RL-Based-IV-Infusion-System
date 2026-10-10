@@ -11,8 +11,8 @@ Sidebar "Simulator" selectbox: "IV Flow Control" (default, the dashboard
 below, unchanged) or "Propofol (Schnider)" (render_propofol_dashboard():
 PropofolSimController x3 on PropofolEnv, BIS / Ce / infusion-rate charts,
 patient sliders, live "Simulate surgical stimulus"; frozen models
-results/propofol_qlearning_qtable.pkl and results/propofol_dqn_model.pt;
-PID gains = TUNED_PID_GAINS; live this-episode metrics table via
+results/propofol_v2_qlearning_qtable.pkl and results/propofol_v2_dqn_model.pt;
+PID = CascadePID with TUNED_PID_GAINS; live this-episode metrics table via
 src/propofol_metrics.py; no batch table in this mode -- batch numbers live in
 results/propofol_eval_summary.json from src/propofol_evaluate.py).
 Streamlit app: live side-by-side comparison of PID, tabular Q-learning, and
@@ -40,8 +40,8 @@ from src.q_learning_agent import QLearningAgent
 from src.dqn_agent import DQNAgent, KEffEstimator, _normalize_state
 from src.propofol_environment import PropofolEnv
 from src.propofol_metrics import compute_propofol_metrics
-from src.propofol_pid_tune import TUNED_PID_GAINS, make_pid
-from src.propofol_train import make_dqn_agent
+from src.propofol_pid_tune import TUNED_PID_GAINS, CascadePID
+from src.propofol_train import DECISION_EVERY, MODEL_PATHS, make_dqn_agent
 
 st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", layout="wide")
 
@@ -331,17 +331,17 @@ def step_all():
 SIM_IV = "IV Flow Control"
 SIM_PROPOFOL = "Propofol (Schnider)"
 
-PF_QTABLE_PATH = "results/propofol_qlearning_qtable.pkl"
-PF_DQN_PATH = "results/propofol_dqn_model.pt"
+PF_QTABLE_PATH = MODEL_PATHS["qlearning"]   # results/propofol_v2_qlearning_qtable.pkl
+PF_DQN_PATH = MODEL_PATHS["dqn"]             # results/propofol_v2_dqn_model.pt
 PF_DT = 5.0                 # s per control step, matches PropofolEnv
 PF_STEPS_PER_TICK = 6       # 30 simulated seconds per screen refresh
 PF_SAFE_BAND = (40.0, 60.0)
 PF_BIS_Y_DOMAIN = (0, 100)
 PF_CE_Y_DOMAIN = (0, 8)
-PF_RATE_Y_DOMAIN = (0, 12.5)
+PF_RATE_Y_DOMAIN = (0, 42)   # infusion levels go to 40; the 1 mg/kg bolus step clips at the top
 
 PF_METRIC_ROWS = {
-    "time_in_target_pct": "Time in target (+-5 BIS) %",
+    "time_in_target_pct": "Time in target (+/-5 BIS) %",
     "pct_bis_below_40": "% time BIS < 40 (too deep)",
     "pct_bis_above_60": "% time BIS > 60 (too light)",
     "IAE": "Total tracking error (IAE, BIS*s)",
@@ -381,11 +381,13 @@ class PropofolSimController:
         self.env.target_schedule[:] = target_bis
         self.env.target = float(target_bis)
         self.env.err = self.env.target - self.env.bis
-        self.state = self.env._discretize(self.env.err, self.env.dbis, self.env.last_level)
         self.done = False
         if kind == "pid":
-            self.pid = make_pid(self.env, **TUNED_PID_GAINS)
-            self.pid.reset()
+            self.pid = CascadePID(self.env, **TUNED_PID_GAINS)
+        else:
+            # same decision interval / bolus-hold rule as training (ActionHold)
+            self.hold_k = DECISION_EVERY[kind]
+            self.action, self.level = 0, 0
 
     def step(self, stim_shift):
         if self.done:
@@ -393,14 +395,17 @@ class PropofolSimController:
         env = self.env
         env.stim_shift[env.step_idx] = stim_shift
         if self.kind == "pid":
-            rate = self.pid.compute(env.bis - env.target)
-            self.state, _, self.done, _ = env.step_continuous(rate)
-        elif self.kind == "qlearning":
-            a = self.agent.select_action(self.state, greedy=True)
-            self.state, _, self.done, _ = env.step(a)
-        elif self.kind == "dqn":
-            a = self.agent.select_action(env.continuous_state(), greedy=True)
-            self.state, _, self.done, _ = env.step(a)
+            _, _, self.done, _ = self.pid.step()
+            return env.history[-1]
+        if env.step_idx % self.hold_k == 0:          # new decision
+            obs = env._discretize() if self.kind == "qlearning" else env.continuous_state()
+            if self.action != env.BOLUS_ACTION:
+                self.level = self.action
+            self.action = self.agent.select_action(obs, greedy=True)
+            sub = self.action
+        else:
+            sub = self.action if self.action != env.BOLUS_ACTION else self.level
+        _, _, self.done, _ = env.step(sub)
         return env.history[-1]
 
 
@@ -531,12 +536,12 @@ def render_propofol_dashboard():
             ql_agent = load_propofol_qlearning_agent()
         except FileNotFoundError:
             st.warning(f"No trained propofol Q-table found at {PF_QTABLE_PATH} -- run "
-                       "`python -m src.propofol_train --agent qlearning --episodes 3000 --seed 0` first.")
+                       "`python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0` first.")
         try:
             dqn_agent = load_propofol_dqn_agent()
         except FileNotFoundError:
             st.warning(f"No trained propofol DQN model found at {PF_DQN_PATH} -- run "
-                       "`python -m src.propofol_train --agent dqn --episodes 600 --seed 0` first.")
+                       "`python -m src.propofol_train --agent dqn --episodes 1500 --seed 0` first.")
 
         patient = dict(age=float(age), weight=float(weight), height=float(height), sex=sex)
         if st.button("Reset episode", type="primary", key="pf_reset"):

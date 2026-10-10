@@ -25,10 +25,11 @@ Schnider covariates (age yr, weight kg, height cm, sex), James-formula LBM:
   Nominal (reference) patient: age 53, 77 kg, 177 cm, male.
 
 PD (BISModel):
-  BIS = E0 - Emax * Ce^g / (Ce50_eff^g + Ce^g)  + N(0, 2.0),  clipped to [0, 100]
-  E0=95  Emax=95  Ce50=4.7 ug/mL (x U(0.75, 1.25) per episode)
+  BIS = E0 - Emax * Ce^g / (Ce50_eff^g + Ce^g)  + N(0, 1.5),  clipped to [0, 100]
+  E0=95  Emax=95  Ce50=4.7 ug/mL (x U(0.85, 1.15) per episode)
                   gamma=2.0     (x U(0.80, 1.20) per episode)
   Ce50_eff = Ce50 * (1 + stimulus_shift(t))
+  (v1 used sigma 2.0 and Ce50 +/-25 %; narrowed in v2 -- see DESIGN.md)
 
 Surgical stimulus (StimulusScheduler)      TRAIN           EVAL
   events per episode                       2 - 4           3 - 4
@@ -36,43 +37,53 @@ Surgical stimulus (StimulusScheduler)      TRAIN           EVAL
   event duration                           2 - 5 min       3 - 5 min
   (overlapping events -> max shift, not compounded; start uniform over episode)
 
+Plant check (scratch numbers, constant infusion, Ce for BIS 50 = 4.46 ug/mL):
+  nominal 53y/77kg/177cm/M : holding Ce ~4.5 at 30 min needs ~10 mg/kg/h;
+                             12 mg/kg/h reaches it only at 11.8 min
+  20y/54kg/161cm/F         : needs ~14.8 mg/kg/h at 30 min; 12 never gets there
+  worst slider corner (20y/50kg/195cm/F): ~18.7 mg/kg/h at 30 min, more under
+                             stimulation -> the original 0-12 mg/kg/h action
+                             range could not reach BIS 50 for much of the
+                             patient range. Units were checked and are correct
+                             (2 mg/kg bolus -> Cp 34.7 ug/mL at 5 s, peak Ce
+                             9.1 ug/mL at 1.6 min, matching Schnider's small V1).
+
 RL environment (PropofolEnv)
-  state   = (BIS_error, dBIS/dt, last_action_level)
+  state   = (BIS_error, dBIS/dt, Ce, last_action, bolus-window phase)
               BIS_error = target - measured BIS        (same sign as IV env)
               dBIS/dt   = slope of EMA-filtered BIS (alpha 0.15), BIS/min
-  bins    = 15 x 7 x 8 = 840 states
-  clips   = |BIS_error| 30.0, |dBIS/dt| 10.0 BIS/min, level = action index 0..7
-  actions = 8 ABSOLUTE infusion levels [0, 3, 6, 8, 10, 13, 18, 30] mg/kg/h
-            -> self.ACTIONS in mg/s for the current patient's weight
-            (originally linspace(0, 12, 8): too little authority -- at 12
-             mg/kg/h the nominal patient needs ~11 min to reach BIS 50 and a
-             Ce50+25 % patient under stimulus can never get there; see DESIGN.md)
+  bins    = 15 x 3 x 12 x 9 x 2 = 9720 states
+  clips   = |BIS_error| 22.5 (3-BIS bins), |dBIS/dt| 6 BIS/min (3 bins),
+            Ce 0-9 ug/mL (0.75 bins), last action 0..8, phase 0/1
+  actions = 8 ABSOLUTE infusion levels [0, 4, 7, 10, 14, 19, 26, 40] mg/kg/h
+            + action 8 = 1 mg/kg induction bolus (first 3 min; afterwards it
+            acts as the top level) -> self.ACTIONS in mg/s for the current
+            patient's weight
   episode = 3600 s = 720 steps (dt=5 s); done early if measured BIS < 20
   target  = 60 for 0-10 min (induction), linear ramp 60->50 over 10-15 min,
             50 thereafter; with p=0.5 one extra step at t ~ U(25, 50) min to
             50 +/- U(5, 10) (stays inside 40-60) held to episode end
-  reward  = -|e|/10 - 5*[BIS < 35 or BIS > 65] - 0.1*|d level|
+  reward  = +1 if |e| < 5 else -0.1*(|e| - 5)
+            - 2 if BIS < 40 or BIS > 60
+            - 0.1*|d level|   (change of infusion level between consecutive
+                               steps; fractional for PID's continuous rate)
             - 200 on early termination (BIS < 20)
-            (d level = change in action-level index, fractional for PID's
-             continuous rate; same spirit as IVInfusionEnv's -0.02*|du|)
-  DQN obs = continuous_state(): [BIS, BIS_error, dBIS/dt, Ce, Cp, last_rate,
-            target_BIS] normalized -> PROPOFOL_STATE_DIM = 7
+  DQN obs = continuous_state(): [BIS_error, dBIS/dt, Ce, last_action,
+            time_since_start, target_BIS] normalized -> PROPOFOL_STATE_DIM = 6
 
 Plain-Python env with reset() -> state / step(a) -> (s', r, done, info), the
 same shape as IVInfusionEnv (no gymnasium -- see DESIGN.md).
 
 INFORMATION BOUNDARY
 ====================
-PID only sees measured BIS (exactly like the IV-env PID only sees measured
-flow). The RL agents additionally see Ce/Cp (DQN) and their own last
-infusion level. Ce/Cp are what a target-controlled-infusion (TCI) pump
-displays: they are the Schnider model's prediction from the patient's
+Every controller sees measured BIS. Ce is what a target-controlled-infusion
+(TCI) pump displays: the Schnider model's prediction from the patient's
 covariates and the infusion history. Because this simulator models no
 pharmacokinetic inter-patient variability (all patient-to-patient
 variability lives in the PD: Ce50, gamma, stimulus), the TCI prediction is
-exactly the plant's Cp/Ce, so they are read straight off the plant. The PD
-side -- Ce50, gamma, and the stimulus shift -- is never exposed to any
-controller.
+exactly the plant's Ce, so it is read straight off the plant. Both RL agents
+and the cascade PID (src/propofol_pid_tune.py) use it. The PD side -- Ce50,
+gamma, and the stimulus shift -- is never exposed to any controller.
 
 SEEDING
 =======
@@ -88,7 +99,7 @@ ends -- the basis of the fair PID vs Q-learning vs DQN comparison.
 import numpy as np
 
 
-PROPOFOL_STATE_DIM = 7  # [BIS, BIS_error, dBIS/dt, Ce, Cp, last_rate, target_BIS]
+PROPOFOL_STATE_DIM = 6  # [BIS_error, dBIS/dt, Ce, last_action, time, target_BIS]
 
 NOMINAL_PATIENT = dict(age=53.0, weight=77.0, height=177.0, sex="male")
 
@@ -304,31 +315,45 @@ class PropofolEnv:
     RL environment around SchniderPlant + BISModel + StimulusScheduler,
     mirroring IVInfusionEnv's reset()/step() API.
 
-    STATE (discretized for tabular Q-learning):
-        e     = target_BIS - measured_BIS
-        de    = slope of EMA-filtered measured BIS (BIS/min)
-        level = index of the last infusion level (0..7)
-      -> single integer state index
+    STATE (discretized for tabular Q-learning), 15 x 3 x 12 x 9 x 2 = 9720:
+        e      = target_BIS - measured_BIS, 15 bins over +/-22.5 (3 BIS each)
+        de     = slope of EMA-filtered BIS, 3 bins over +/-6 BIS/min
+                 (falling < -2 / flat / rising > +2)
+        Ce     = effect-site concentration, 12 bins over 0-9 ug/mL (0.75 each)
+        action = last action index 0..8 (8 = bolus)
+        phase  = 1 while the induction-bolus window (first 3 min) is open
 
-    ACTION: index into RATE_LEVELS_MG_KG_H = [0, 3, 6, 8, 10, 13, 18, 30] mg/kg/h.
-      NOTE: absolute rate levels, NOT deltas like IVInfusionEnv.ACTIONS --
-      propofol pumps are commanded with an absolute rate, and a delta action
-      would add an integrator the agent has to undo. self.ACTIONS holds the
-      same levels converted to mg/s for the current patient's weight.
-      Non-uniform on purpose: 2 mg/kg/h resolution over the nominal
-      maintenance range (6-10), 13/18 for resistant patients / stimulation,
-      30 as the induction "push" level (no separate bolus action).
+    ACTIONS (9):
+        0..7 : ABSOLUTE infusion levels RATE_LEVELS_MG_KG_H =
+               [0, 4, 7, 10, 14, 19, 26, 40] mg/kg/h (roughly log-spaced, so
+               the step size is proportional across the 3x range of
+               maintenance needs in the patient ranges)
+        8    : induction bolus, 1 mg/kg delivered within one 5-s step, only
+               during the first 3 min; after that it acts as level 7
+        NOTE: absolute rate levels, NOT deltas like IVInfusionEnv.ACTIONS --
+        propofol pumps are commanded with an absolute rate. self.ACTIONS holds
+        the per-action mg/s for the current patient's weight (bolus = its
+        5-s equivalent rate).
 
-    REWARD: -|e|/10 - 5*(BIS<35 or BIS>65) - 0.1*|d level| (- 200 if BIS<20)
+    REWARD (per 5-s step):
+        +1                     if |BIS - target| < 5
+        -0.1 * (|e| - 5)       otherwise
+        -2                     if BIS < 40 or BIS > 60
+        -0.1 * |d level|       change of infusion level between consecutive
+                               steps (fractional for PID's continuous rate;
+                               the bolus step itself is not penalized)
+        -200                   on early termination (BIS < 20)
     """
 
-    RATE_LEVELS_MG_KG_H = np.array([0.0, 3.0, 6.0, 8.0, 10.0, 13.0, 18.0, 30.0])
-    MAX_RATE_MG_KG_H = 30.0
-    CONC_SCALE = 5.0  # ug/mL, ~Ce50, normalizes Ce/Cp for DQN
+    RATE_LEVELS_MG_KG_H = np.array([0.0, 4.0, 7.0, 10.0, 14.0, 19.0, 26.0, 40.0])
+    MAX_RATE_MG_KG_H = 40.0
+    BOLUS_MG_PER_KG = 1.0
+    BOLUS_WINDOW_S = 180.0
+    CONC_SCALE = 5.0  # ug/mL, ~Ce50, normalizes Ce for DQN
 
     def __init__(self, dt=5.0, episode_len=3600.0, seed=None, mode="train",
-                 err_bins=15, dbis_bins=7, err_clip=30.0, dbis_clip=10.0,
-                 bis_noise_std=2.0, dbis_filter_alpha=0.15,
+                 err_bins=15, dbis_bins=3, ce_bins=12, err_clip=22.5, dbis_clip=6.0, ce_max=9.0,
+                 bis_noise_std=1.5, dbis_filter_alpha=0.15,
                  patient=None, randomize_pd=True, stimuli=True, extra_target_steps=True,
                  du_penalty=0.1, terminal_penalty=200.0, terminate_bis=20.0):
         self.dt = float(dt)
@@ -337,11 +362,12 @@ class PropofolEnv:
         self.mode = mode
         self.rng = np.random.default_rng(seed)  # draws one episode seed per reset()
 
-        self.err_bins, self.dbis_bins = err_bins, dbis_bins
-        self.err_clip, self.dbis_clip = err_clip, dbis_clip
+        self.err_bins, self.dbis_bins, self.ce_bins = err_bins, dbis_bins, ce_bins
+        self.err_clip, self.dbis_clip, self.ce_max = err_clip, dbis_clip, ce_max
         self.n_levels = len(self.RATE_LEVELS_MG_KG_H)
-        self.n_states = err_bins * dbis_bins * self.n_levels
-        self.n_actions = self.n_levels
+        self.BOLUS_ACTION = self.n_levels
+        self.n_actions = self.n_levels + 1
+        self.n_states = err_bins * dbis_bins * ce_bins * self.n_actions * 2
 
         self.bis_noise_std = bis_noise_std
         self.dbis_filter_alpha = dbis_filter_alpha
@@ -353,13 +379,13 @@ class PropofolEnv:
         self.terminal_penalty = terminal_penalty
         self.terminate_bis = terminate_bis
         self.target_band = 5.0
-        self.safe_low, self.safe_high = 35.0, 65.0
+        self.safe_low, self.safe_high = 40.0, 60.0
 
         p = self.fixed_patient or NOMINAL_PATIENT
         self.patient = dict(p)
         self.plant = SchniderPlant(dt=self.dt, **self.patient)
         self.bis_model = BISModel(noise_std=bis_noise_std)
-        self.ACTIONS = self.RATE_LEVELS_MG_KG_H * self.patient["weight"] / 3600.0
+        self._set_actions()
 
         self.stim_shift = np.zeros(self.n_steps)
         self.target_schedule = np.full(self.n_steps, INDUCTION_TARGET)
@@ -367,6 +393,11 @@ class PropofolEnv:
         self.target = INDUCTION_TARGET
         self.step_idx = 0
         self.history = []
+
+    def _set_actions(self):
+        w = self.patient["weight"]
+        self.ACTIONS = np.append(self.RATE_LEVELS_MG_KG_H * w / 3600.0,
+                                 self.BOLUS_MG_PER_KG * w / self.dt)
 
     # ---------- per-episode randomization ----------
     def _sample_patient(self, rng):
@@ -390,7 +421,7 @@ class PropofolEnv:
         self.patient = dict(self.fixed_patient) if self.fixed_patient else self._sample_patient(pat_rng)
         self.plant.set_patient(**self.patient)
         self.plant.reset()
-        self.ACTIONS = self.RATE_LEVELS_MG_KG_H * self.patient["weight"] / 3600.0
+        self._set_actions()
 
         self.bis_model.rng = noise_rng
         if self.randomize_pd:
@@ -414,29 +445,34 @@ class PropofolEnv:
         self.dbis = 0.0
         self.err = self.target - self.bis
         self.last_rate = 0.0
-        self.last_level = 0
+        self.last_action = 0
         self.last_level_frac = 0.0
         self.total_drug_mg = 0.0
-        return self._discretize(self.err, self.dbis, self.last_level)
+        return self._discretize()
 
     # ---------- observations ----------
-    def _discretize(self, err, dbis, level):
-        e_idx = int(_clip((err + self.err_clip) / (2 * self.err_clip) * self.err_bins,
+    def bolus_window_open(self):
+        return self.step_idx * self.dt < self.BOLUS_WINDOW_S
+
+    def _discretize(self):
+        e_idx = int(_clip((self.err + self.err_clip) / (2 * self.err_clip) * self.err_bins,
                           0, self.err_bins - 1))
-        d_idx = int(_clip((dbis + self.dbis_clip) / (2 * self.dbis_clip) * self.dbis_bins,
+        d_idx = int(_clip((self.dbis + self.dbis_clip) / (2 * self.dbis_clip) * self.dbis_bins,
                           0, self.dbis_bins - 1))
-        return (e_idx * self.dbis_bins + d_idx) * self.n_levels + int(level)
+        c_idx = int(_clip(self.plant.Ce / self.ce_max * self.ce_bins, 0, self.ce_bins - 1))
+        phase = 1 if self.bolus_window_open() else 0
+        return (((e_idx * self.dbis_bins + d_idx) * self.ce_bins + c_idx) * self.n_actions
+                + int(self.last_action)) * 2 + phase
 
     def continuous_state(self):
         """Normalized DQN feature vector (same role as dqn_agent._normalize_state):
-        [BIS, BIS_error, dBIS/dt, Ce, Cp, last_rate, target_BIS]."""
+        [BIS_error, dBIS/dt, Ce, last_action, time_since_start, target_BIS]."""
         return np.array([
-            self.bis / 100.0,
             _clip(self.err / self.err_clip, -3.0, 3.0),
             _clip(self.dbis / self.dbis_clip, -3.0, 3.0),
             _clip(self.plant.Ce / self.CONC_SCALE, 0.0, 3.0),
-            _clip(self.plant.Cp / self.CONC_SCALE, 0.0, 3.0),
-            self.last_rate / self.MAX_RATE_MG_KG_H,
+            self.last_action / (self.n_actions - 1),
+            self.step_idx * self.dt / self.episode_len,
             self.target / 100.0,
         ], dtype=np.float32)
 
@@ -445,21 +481,28 @@ class PropofolEnv:
 
     # ---------- dynamics ----------
     def step(self, action_idx):
-        """Discrete action: absolute infusion level index (RL agents)."""
-        action_idx = int(action_idx)
-        return self._advance(float(self.RATE_LEVELS_MG_KG_H[action_idx]), action_idx, float(action_idx))
+        """Discrete action (RL agents, and the PID's one-off induction bolus):
+        0..7 = absolute infusion level, 8 = bolus (first 3 min only)."""
+        a = int(action_idx)
+        if a == self.BOLUS_ACTION:
+            if self.bolus_window_open():
+                bolus_mg = self.BOLUS_MG_PER_KG * self.patient["weight"]
+                return self._advance(0.0, a, self.last_level_frac, bolus_mg=bolus_mg)
+            a_rate = self.n_levels - 1          # window closed: acts as the top level
+            return self._advance(float(self.RATE_LEVELS_MG_KG_H[a_rate]), a, float(a_rate))
+        return self._advance(float(self.RATE_LEVELS_MG_KG_H[a]), a, float(a))
 
     def step_continuous(self, rate_mg_kg_h):
-        """Continuous infusion rate in mg/kg/h (PID baseline), clipped to [0, 30].
-        Same dynamics/reward as step(); the state's level feature uses the
+        """Continuous infusion rate in mg/kg/h (PID baseline), clipped to [0, 40].
+        Same dynamics/reward as step(); the state's action feature uses the
         nearest discrete level, the smoothness penalty the fractional level
         (rate interpolated onto the level-index scale)."""
         rate = _clip(float(rate_mg_kg_h), 0.0, self.MAX_RATE_MG_KG_H)
         level_frac = float(np.interp(rate, self.RATE_LEVELS_MG_KG_H, np.arange(self.n_levels)))
         return self._advance(rate, self.nearest_level(rate), level_frac)
 
-    def _advance(self, rate_mg_kg_h, level, level_frac):
-        u = rate_mg_kg_h * self.patient["weight"] / 3600.0  # mg/s
+    def _advance(self, rate_mg_kg_h, action, level_frac, bolus_mg=0.0):
+        u = rate_mg_kg_h * self.patient["weight"] / 3600.0 + bolus_mg / self.dt  # mg/s
         self.target = float(self.target_schedule[self.step_idx])
         shift = float(self.stim_shift[self.step_idx])
 
@@ -471,28 +514,28 @@ class PropofolEnv:
         self.bis_filt = prev_filt + self.dbis_filter_alpha * (bis - prev_filt)
         self.dbis = (self.bis_filt - prev_filt) / self.dt * 60.0  # BIS/min
         err = self.target - bis
-        du = level_frac - self.last_level_frac  # change in action level (smoothness)
+        abs_e = abs(err)
 
         terminated = bis < self.terminate_bis
-        reward = -abs(err) / 10.0
+        reward = 1.0 if abs_e < self.target_band else -0.1 * (abs_e - self.target_band)
         if bis < self.safe_low or bis > self.safe_high:
-            reward -= 5.0
-        reward -= self.du_penalty * abs(du)
+            reward -= 2.0
+        reward -= self.du_penalty * abs(level_frac - self.last_level_frac)
         if terminated:
             reward -= self.terminal_penalty
 
         self.total_drug_mg += u * self.dt
         self.history.append(dict(
             t=self.step_idx * self.dt, target=self.target, measured=bis, error=err,
-            bis_true=bis_true, ce=ce, cp=cp, rate_mg_kg_h=rate_mg_kg_h, rate_mg_s=u,
-            command=rate_mg_kg_h, stim_shift=shift,
-            ce50_eff=self.bis_model.ce50 * (1.0 + shift),
+            bis_true=bis_true, ce=ce, cp=cp, rate_mg_kg_h=u * 3600.0 / self.patient["weight"],
+            rate_mg_s=u, bolus_mg=bolus_mg, command=rate_mg_kg_h, action=action,
+            stim_shift=shift, ce50_eff=self.bis_model.ce50 * (1.0 + shift),
         ))
 
         self.bis, self.err = bis, err
-        self.last_rate, self.last_level, self.last_level_frac = rate_mg_kg_h, level, level_frac
+        self.last_rate, self.last_action, self.last_level_frac = rate_mg_kg_h, action, level_frac
         self.step_idx += 1
         truncated = self.step_idx >= self.n_steps
         done = terminated or truncated
-        next_state = self._discretize(err, self.dbis, level)
-        return next_state, reward, done, {"terminated": terminated, "truncated": truncated and not terminated}
+        return self._discretize(), reward, done, {"terminated": terminated,
+                                                  "truncated": truncated and not terminated}

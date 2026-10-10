@@ -8,9 +8,11 @@ pytest suite for src/propofol_environment.py (run: pytest tests/ -v)
   PD   : 2 mg/kg bolus -> noise-free BIS strictly decreasing from the moment
          Ce starts rising until the effect-site peak (>= 60 s window), with a
          >= 15-point BIS drop
-  API  : reset()/step() types and shapes, continuous_state() is 7-dim,
-         ACTIONS are absolute mg/s levels, 720-step episodes, done by step 720,
-         early termination on BIS < 20
+  API  : reset()/step() types and shapes, continuous_state() is 6-dim,
+         ACTIONS are absolute mg/s levels + a bolus, 720-step episodes, done by
+         step 720, early termination on BIS < 20, bolus only in the first 3 min
+  PID  : cascade PID reaches the 40-60 band within 8 min for the nominal and
+         a young (20 y, 54 kg, 161 cm) patient and stays mostly in target
   Seeds: same constructor seed -> identical patient / PD / stimulus / target
          schedule on every reset regardless of the controller's actions or
          episode length (fair-comparison guarantee used by propofol_evaluate)
@@ -103,10 +105,11 @@ def test_reset_and_step_api_shapes():
     env = PropofolEnv(seed=3)
     s = env.reset()
     assert isinstance(s, int) and 0 <= s < env.n_states
-    assert env.n_states == 15 * 7 * 8 and env.n_actions == 8
-    assert env.ACTIONS.shape == (8,)
+    assert env.n_states == 15 * 3 * 12 * 9 * 2 and env.n_actions == 9
+    assert env.ACTIONS.shape == (9,)
     assert env.ACTIONS[0] == 0.0
-    assert env.ACTIONS[-1] == pytest.approx(12.0 * env.patient["weight"] / 3600.0)
+    assert env.ACTIONS[7] == pytest.approx(40.0 * env.patient["weight"] / 3600.0)
+    assert env.ACTIONS[8] == pytest.approx(1.0 * env.patient["weight"] / env.dt)   # bolus, mg/s for 5 s
 
     obs = env.continuous_state()
     assert obs.shape == (PROPOFOL_STATE_DIM,) and obs.dtype == np.float32
@@ -140,7 +143,7 @@ def test_episode_is_720_steps():
 def test_done_fires_at_or_before_720_under_any_policy(seed):
     env = PropofolEnv(seed=seed)
     rng = np.random.default_rng(seed)
-    for policy in (lambda: 7, lambda: int(rng.integers(8))):
+    for policy in (lambda: 7, lambda: int(rng.integers(9))):
         env.reset()
         n, done = 0, False
         while not done and n < 1000:
@@ -188,7 +191,7 @@ def test_same_seed_same_patient_and_schedule_regardless_of_controller(mode):
         while not done:
             _, _, done, _ = env_a.step(7)
         for _ in range(10 + 50 * episode):
-            env_b.step(int(rng.integers(8)))
+            env_b.step(int(rng.integers(9)))
     assert env_a.stim_shift.max() >= 0.15        # stimuli actually present
 
 
@@ -255,3 +258,49 @@ def test_metrics_pad_early_termination():
     m = compute_propofol_metrics(env.history, env.target_change_steps, env.n_steps, env.dt)
     assert m["terminated_early"] == 1.0
     assert m["pct_bis_below_40"] > 50.0   # scored as staying overdosed for the rest of the hour
+
+
+def test_bolus_only_during_induction_window():
+    env = PropofolEnv(seed=0, patient=NOMINAL_PATIENT, stimuli=False)
+    env.reset()
+    env.step(env.BOLUS_ACTION)
+    h = env.history[-1]
+    assert h["bolus_mg"] == pytest.approx(77.0)              # 1 mg/kg
+    assert h["rate_mg_s"] * env.dt == pytest.approx(77.0)
+    for _ in range(int(env.BOLUS_WINDOW_S / env.dt)):        # run past the 3-min window
+        env.step(0)
+    env.step(env.BOLUS_ACTION)
+    h = env.history[-1]
+    assert h["bolus_mg"] == 0.0
+    assert h["command"] == env.RATE_LEVELS_MG_KG_H[-1]       # acts as the top infusion level
+
+
+def test_nominal_inverse_bis_roundtrip():
+    bm = BISModel(noise_std=0.0)
+    for bis in (40.0, 50.0, 60.0):
+        assert bm.true_bis(BISModel.nominal_ce_for_bis(bis)) == pytest.approx(bis)
+
+
+def _flat_target_episode(patient, minutes=30, target=50.0, seed=0):
+    env = PropofolEnv(seed=seed, mode="eval", patient=patient, stimuli=False,
+                      extra_target_steps=False, episode_len=minutes * 60.0)
+    env.reset()
+    env.target_schedule[:] = target
+    env.target = target
+    return env
+
+
+@pytest.mark.parametrize("patient", [NOMINAL_PATIENT, dict(age=20, weight=54, height=161, sex="female")])
+def test_cascade_pid_reaches_band_within_8_min(patient):
+    from src.propofol_metrics import compute_propofol_metrics
+    from src.propofol_pid_tune import TUNED_PID_GAINS, CascadePID
+    env = _flat_target_episode(patient)
+    pid = CascadePID(env, **TUNED_PID_GAINS)
+    done = False
+    while not done:
+        _, _, done, _ = pid.step()
+    bis = np.array([h["bis_true"] for h in env.history])
+    first_in_band = int(np.argmax((bis >= 40) & (bis <= 60)))
+    assert first_in_band * env.dt <= 8 * 60
+    m = compute_propofol_metrics(env.history, [], env.n_steps, env.dt)
+    assert m["time_in_target_pct"] > 70.0 and m["terminated_early"] == 0.0

@@ -59,6 +59,26 @@ error more accurately overall; tabular Q-learning is limited by its coarse
 lookup table. See `src/environment.py` and `src/evaluate.py` for the full
 technical writeup and numbers.
 
+## Second simulator: propofol anesthesia (Schnider)
+
+Pick **Simulator: Propofol (Schnider)** in the sidebar to switch the whole
+dashboard to a second plant: a Schnider 3-compartment propofol PK model with
+an effect-site compartment and a BIS (depth-of-anesthesia) Emax model. The
+same three controller types compete: a cascade PID (tuned on the reference
+patient only), tabular Q-learning and DQN (trained across random patients and
+random surgical stimuli). Set the patient's age / weight / height / sex and
+the target BIS, press START, and fire **Simulate surgical stimulus** mid-run.
+Every design decision, the debugging history and the honest results are in
+[DESIGN.md](DESIGN.md).
+
+```bash
+python -m pytest tests/ -v                                     # propofol env tests
+python -m src.propofol_pid_tune --seed 0                       # PID tuning (nominal patient)
+python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0
+python -m src.propofol_train --agent dqn --episodes 1500 --seed 0
+python -m src.propofol_evaluate --n_eval 50                    # 50 random patients, CSV + plots
+```
+
 ## Project structure
 
 ```
@@ -70,6 +90,12 @@ src/
   metrics.py               # IAE / ISE / ITAE / ITSE and other scoring
   train.py                  # trains Q-learning / DQN offline
   evaluate.py               # runs the 30-episode head-to-head comparison
+  propofol_environment.py   # Schnider PK + BIS PD + surgical stimuli + RL env
+  propofol_pid_tune.py      # cascade PID baseline + scipy tuning
+  propofol_train.py         # trains Q-learning / DQN on the propofol env
+  propofol_evaluate.py      # 50-patient propofol comparison (CSV + plots)
+  propofol_metrics.py       # time-in-target, BIS<40 / >60, IAE, drug used
+tests/                      # pytest suite for the propofol simulator
 app.py                     # the Streamlit dashboard
 results/                    # trained models + saved comparison plots
 ```
