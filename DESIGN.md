@@ -342,17 +342,21 @@ and DQN < PID < Q-learning for the reference patient.
   female patient, below the requested 70 %. Its policy is coarse. 30-s
   decisions on a 9,720-state table give visibly jumpy infusion: the rate
   swings between levels each decision, and that is visible in
-  `results/propofol_eval_bis.png`. A 40,000-episode re-run was tried and is
-  reported in section 16. Remaining levers are a larger smoothness weight,
+  `results/propofol_eval_bis.png`. A 40,000-episode re-run did not help
+  (section 16). Remaining levers are a larger smoothness weight,
   tile coding, or delta actions. They were not pursued to avoid tuning against
   the report patients.
 
 ## 16. Log of the second Q-learning attempt
 
 A 40,000-episode Q-learning run (k = 6) was trained and compared with the
-20,000-episode table on the validation seeds 30000+. The outcome is recorded
-in the final report and in the commit that lands it. The table that wins on
-validation is the one in `results/`.
+20,000-episode table on the validation seeds 30000+. Its training return had
+already plateaued at about 285 (last 2,000 episodes), the same level as the
+20k run. On validation it was not better: 76.8 % time-in-target and IAE
+13,158, against 77.9 % and 12,771 for the 20k table. The **20k table stays**
+in `results/`. More episodes do not fix the tabular agent's young-patient
+shortfall. Its limit is representational: coarse bins and 30-s absolute
+levels.
 
 ## 17. Minto remifentanil plant: skipped
 

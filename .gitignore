@@ -8,3 +8,5 @@ __pycache__/
 !results/propofol_qlearning_qtable.pkl
 !results/propofol_dqn_model.pt
 .pytest_cache/
+!results/propofol_v2_qlearning_qtable.pkl
+!results/propofol_v2_dqn_model.pt
