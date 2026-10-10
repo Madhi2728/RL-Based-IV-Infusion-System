@@ -11,8 +11,10 @@ pytest suite for src/propofol_environment.py (run: pytest tests/ -v)
   API  : reset()/step() types and shapes, continuous_state() is 6-dim,
          ACTIONS are absolute mg/s levels + a bolus, 720-step episodes, done by
          step 720, early termination on BIS < 20, bolus only in the first 3 min
-  PID  : cascade PID reaches the 40-60 band within 8 min for the nominal and
-         a young (20 y, 54 kg, 161 cm) patient and stays mostly in target
+  PID  : BIS-only PID reaches the 40-60 band within 8 min for the nominal and
+         a young (20 y, 54 kg, 161 cm) patient and stays > 70 % in target;
+         the PID never reads plant state (Ce/Cp)
+  obs  : obs_mode='bis' exposes no Ce (state/feature sizes, Ce-independence)
   Seeds: same constructor seed -> identical patient / PD / stimulus / target
          schedule on every reset regardless of the controller's actions or
          episode length (fair-comparison guarantee used by propofol_evaluate)
@@ -291,11 +293,11 @@ def _flat_target_episode(patient, minutes=30, target=50.0, seed=0):
 
 
 @pytest.mark.parametrize("patient", [NOMINAL_PATIENT, dict(age=20, weight=54, height=161, sex="female")])
-def test_cascade_pid_reaches_band_within_8_min(patient):
+def test_bis_only_pid_reaches_band_within_8_min(patient):
     from src.propofol_metrics import compute_propofol_metrics
-    from src.propofol_pid_tune import TUNED_PID_GAINS, CascadePID
+    from src.propofol_pid_tune import TUNED_PID_GAINS, BISPID
     env = _flat_target_episode(patient)
-    pid = CascadePID(env, **TUNED_PID_GAINS)
+    pid = BISPID(env, **TUNED_PID_GAINS)
     done = False
     while not done:
         _, _, done, _ = pid.step()
@@ -304,3 +306,57 @@ def test_cascade_pid_reaches_band_within_8_min(patient):
     assert first_in_band * env.dt <= 8 * 60
     m = compute_propofol_metrics(env.history, [], env.n_steps, env.dt)
     assert m["time_in_target_pct"] > 70.0 and m["terminated_early"] == 0.0
+
+
+class _NoPlantStateEnv(PropofolEnv):
+    """PropofolEnv whose plant raises if anything outside the env reads Ce/Cp."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._guard = False
+
+    @property
+    def plant(self):
+        if self._guard:
+            raise AssertionError("controller read env.plant (Ce/Cp)")
+        return self._plant
+
+    @plant.setter
+    def plant(self, value):
+        self._plant = value
+
+
+def test_bis_only_pid_never_reads_plant_state():
+    from src.propofol_pid_tune import TUNED_PID_GAINS, BISPID
+    env = _NoPlantStateEnv(seed=0, mode="eval")
+    env.reset()
+    pid = BISPID(env, **TUNED_PID_GAINS)
+    real_advance = env._advance
+
+    def guarded_advance(*a, **kw):        # the env itself may use its plant
+        env._guard = False
+        try:
+            return real_advance(*a, **kw)
+        finally:
+            env._guard = True
+
+    env._advance = guarded_advance
+    env._guard = True
+    done = False
+    while not done:
+        _, _, done, _ = pid.step()       # AssertionError if the PID touches env.plant
+
+
+def test_bis_obs_mode_hides_ce():
+    from src.propofol_environment import PROPOFOL_BIS_STATE_DIM
+    a = PropofolEnv(seed=1, obs_mode="bis")
+    b = PropofolEnv(seed=1, obs_mode="bis")
+    a.reset()
+    b.reset()
+    assert a.n_states == 15 * 5 * 9 * 4 and a.state_dim == PROPOFOL_BIS_STATE_DIM == 5
+    for _ in range(30):
+        a.step(5)
+        b.step(5)
+    b.plant.Ce += 3.0                       # different hidden drug state ...
+    assert a._discretize() == b._discretize()                       # ... same observation
+    np.testing.assert_array_equal(a.continuous_state(), b.continuous_state())

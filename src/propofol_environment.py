@@ -69,7 +69,15 @@ RL environment (PropofolEnv)
                                steps; fractional for PID's continuous rate)
             - 200 on early termination (BIS < 20)
   DQN obs = continuous_state(): [BIS_error, dBIS/dt, Ce, last_action,
-            time_since_start, target_BIS] normalized -> PROPOFOL_STATE_DIM = 6
+            time_since_start (/3600 s), target_BIS] normalized
+            -> PROPOFOL_STATE_DIM = 6
+  obs_mode="bis" (v3, robustness study): no Ce anywhere --
+            tabular = err 15 x dBIS/dt 5 x last action 9 x time bin 4
+                      (0-3 | 3-10 | 10-30 | 30+ min) = 2700 states
+            DQN     = [BIS_error, dBIS/dt, last_action, time, target_BIS]
+                      -> PROPOFOL_BIS_STATE_DIM = 5
+  ce50_jitter (default 0.15) sets the per-episode Ce50 spread; the
+            robustness study uses 0.30 with bis_noise_std=2.0
 
 Plain-Python env with reset() -> state / step(a) -> (s', r, done, info), the
 same shape as IVInfusionEnv (no gymnasium -- see DESIGN.md).
@@ -81,9 +89,11 @@ Every controller sees measured BIS. Ce is what a target-controlled-infusion
 covariates and the infusion history. Because this simulator models no
 pharmacokinetic inter-patient variability (all patient-to-patient
 variability lives in the PD: Ce50, gamma, stimulus), the TCI prediction is
-exactly the plant's Ce, so it is read straight off the plant. Both RL agents
-and the cascade PID (src/propofol_pid_tune.py) use it. The PD side -- Ce50,
-gamma, and the stimulus shift -- is never exposed to any controller.
+exactly the plant's Ce -- effectively oracle plant state. The default PID
+(BISPID, src/propofol_pid_tune.py) therefore never reads it; obs_mode="ce" RL
+agents (v2, the app's models) do, obs_mode="bis" agents (robustness study
+headline) do not. The PD side -- Ce50, gamma, and the stimulus shift -- is
+never exposed to any controller.
 
 SEEDING
 =======
@@ -99,7 +109,8 @@ ends -- the basis of the fair PID vs Q-learning vs DQN comparison.
 import numpy as np
 
 
-PROPOFOL_STATE_DIM = 6  # [BIS_error, dBIS/dt, Ce, last_action, time, target_BIS]
+PROPOFOL_STATE_DIM = 6      # obs_mode="ce" : [BIS_error, dBIS/dt, Ce, last_action, time, target_BIS]
+PROPOFOL_BIS_STATE_DIM = 5  # obs_mode="bis": [BIS_error, dBIS/dt, last_action, time, target_BIS]
 
 NOMINAL_PATIENT = dict(age=53.0, weight=77.0, height=177.0, sex="male")
 
@@ -350,24 +361,44 @@ class PropofolEnv:
     BOLUS_MG_PER_KG = 1.0
     BOLUS_WINDOW_S = 180.0
     CONC_SCALE = 5.0  # ug/mL, ~Ce50, normalizes Ce for DQN
+    TIME_BIN_EDGES_S = (0.0, 180.0, 600.0, 1800.0)  # obs_mode="bis" time bins (lower edges)
+    TIME_SCALE_S = 3600.0                           # normalizes the DQN time feature
 
     def __init__(self, dt=5.0, episode_len=3600.0, seed=None, mode="train",
                  err_bins=15, dbis_bins=3, ce_bins=12, err_clip=22.5, dbis_clip=6.0, ce_max=9.0,
                  bis_noise_std=1.5, dbis_filter_alpha=0.15,
                  patient=None, randomize_pd=True, stimuli=True, extra_target_steps=True,
-                 du_penalty=0.1, terminal_penalty=200.0, terminate_bis=20.0):
+                 du_penalty=0.1, terminal_penalty=200.0, terminate_bis=20.0,
+                 ce50_jitter=0.15, obs_mode="ce"):
         self.dt = float(dt)
         self.episode_len = float(episode_len)
         self.n_steps = int(round(episode_len / dt))
         self.mode = mode
         self.rng = np.random.default_rng(seed)  # draws one episode seed per reset()
 
+        # obs_mode="ce" : the v2 observations above (Ce from the TCI model)
+        # obs_mode="bis": BIS-derived features only -- what a BIS monitor plus
+        #                 the pump's own action log provide (no Ce):
+        #   tabular = err 15 x dBIS/dt 5 (over +/-6 BIS/min) x last action 9
+        #             x time bin 4 (0-3 | 3-10 | 10-30 | 30+ min) = 2700 states
+        #   DQN     = [BIS_error, dBIS/dt, last_action, time, target_BIS] (5)
+        if obs_mode not in ("ce", "bis"):
+            raise ValueError(f"obs_mode must be 'ce' or 'bis', got {obs_mode!r}")
+        self.obs_mode = obs_mode
+        if obs_mode == "bis" and dbis_bins == 3:
+            dbis_bins = 5
+        self.ce50_jitter = ce50_jitter
         self.err_bins, self.dbis_bins, self.ce_bins = err_bins, dbis_bins, ce_bins
         self.err_clip, self.dbis_clip, self.ce_max = err_clip, dbis_clip, ce_max
         self.n_levels = len(self.RATE_LEVELS_MG_KG_H)
         self.BOLUS_ACTION = self.n_levels
         self.n_actions = self.n_levels + 1
-        self.n_states = err_bins * dbis_bins * ce_bins * self.n_actions * 2
+        if obs_mode == "ce":
+            self.n_states = err_bins * dbis_bins * ce_bins * self.n_actions * 2
+            self.state_dim = PROPOFOL_STATE_DIM
+        else:
+            self.n_states = err_bins * dbis_bins * self.n_actions * len(self.TIME_BIN_EDGES_S)
+            self.state_dim = PROPOFOL_BIS_STATE_DIM
 
         self.bis_noise_std = bis_noise_std
         self.dbis_filter_alpha = dbis_filter_alpha
@@ -425,7 +456,7 @@ class PropofolEnv:
 
         self.bis_model.rng = noise_rng
         if self.randomize_pd:
-            self.bis_model.jitter(pd_rng)
+            self.bis_model.jitter(pd_rng, ce50_frac=self.ce50_jitter)
         else:
             self.bis_model.nominal()
 
@@ -459,6 +490,11 @@ class PropofolEnv:
                           0, self.err_bins - 1))
         d_idx = int(_clip((self.dbis + self.dbis_clip) / (2 * self.dbis_clip) * self.dbis_bins,
                           0, self.dbis_bins - 1))
+        if self.obs_mode == "bis":
+            t = self.step_idx * self.dt
+            t_idx = sum(1 for edge in self.TIME_BIN_EDGES_S[1:] if t >= edge)
+            return ((e_idx * self.dbis_bins + d_idx) * self.n_actions
+                    + int(self.last_action)) * len(self.TIME_BIN_EDGES_S) + t_idx
         c_idx = int(_clip(self.plant.Ce / self.ce_max * self.ce_bins, 0, self.ce_bins - 1))
         phase = 1 if self.bolus_window_open() else 0
         return (((e_idx * self.dbis_bins + d_idx) * self.ce_bins + c_idx) * self.n_actions
@@ -466,15 +502,19 @@ class PropofolEnv:
 
     def continuous_state(self):
         """Normalized DQN feature vector (same role as dqn_agent._normalize_state):
-        [BIS_error, dBIS/dt, Ce, last_action, time_since_start, target_BIS]."""
-        return np.array([
-            _clip(self.err / self.err_clip, -3.0, 3.0),
-            _clip(self.dbis / self.dbis_clip, -3.0, 3.0),
-            _clip(self.plant.Ce / self.CONC_SCALE, 0.0, 3.0),
-            self.last_action / (self.n_actions - 1),
-            self.step_idx * self.dt / self.episode_len,
-            self.target / 100.0,
-        ], dtype=np.float32)
+        [BIS_error, dBIS/dt, Ce, last_action, time_since_start, target_BIS]
+        (obs_mode="bis": the same without Ce). Time is scaled by a FIXED 3600 s,
+        not episode_len, so shorter app episodes see the same feature scale as
+        training."""
+        err = _clip(self.err / self.err_clip, -3.0, 3.0)
+        dbis = _clip(self.dbis / self.dbis_clip, -3.0, 3.0)
+        act = self.last_action / (self.n_actions - 1)
+        t = self.step_idx * self.dt / self.TIME_SCALE_S
+        tgt = self.target / 100.0
+        if self.obs_mode == "bis":
+            return np.array([err, dbis, act, t, tgt], dtype=np.float32)
+        ce = _clip(self.plant.Ce / self.CONC_SCALE, 0.0, 3.0)
+        return np.array([err, dbis, ce, act, t, tgt], dtype=np.float32)
 
     def nearest_level(self, rate_mg_kg_h):
         return int(np.argmin(np.abs(self.RATE_LEVELS_MG_KG_H - rate_mg_kg_h)))

@@ -5,7 +5,7 @@ propofol_evaluate.py
 Eval episodes: --n_eval, default 50 (eval seeds 20000 + i), PropofolEnv mode="eval"
                (random patient age 20-80 / 50-110 kg / 150-195 cm / M-F, Ce50
                +/-15 %, gamma +/-20 %, 3-4 stimuli of +20-30 % Ce50, 3-5 min).
-Controllers  : cascade PID (CascadePID + TUNED_PID_GAINS from src/propofol_pid_tune.py, tuned on the
+Controllers  : BIS-only PID (BISPID + TUNED_PID_GAINS from src/propofol_pid_tune.py, tuned on the
                nominal patient only), Q-learning (--qtable, default
                results/propofol_v2_qlearning_qtable.pkl), DQN (--dqn_model, default
                results/propofol_v2_dqn_model.pt);

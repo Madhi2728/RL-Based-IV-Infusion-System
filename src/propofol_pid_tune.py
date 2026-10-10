@@ -2,42 +2,36 @@
 propofol_pid_tune.py
 ---------------------
 
-PID baseline for PropofolEnv: a CASCADE built from two src/pid_controller.PIDController
-instances, plus a fixed induction bolus.
-  t = 0      : one 1 mg/kg induction bolus (env action BOLUS_ACTION), then:
-  outer loop : Ce_ref = Ce_nominal(target_BIS) + I-only trim on (BIS - target)
-               Ce_nominal(B) = inverse of the NOMINAL BIS curve (Ce50 4.7, gamma 2)
-               trim = PIDController(kp=0, ki=OUTER_KI, kd=0), clamped to
-               +/- OUTER_TRIM_CAP ug/mL (anti-windup via integral_limit)
-               -> slowly corrects for the unknown patient sensitivity / stimuli
-  inner loop : rate = PID(Ce_ref - Ce), Ce = TCI-model effect-site estimate
-               output clipped to [0, 40] mg/kg/h, driven through
-               env.step_continuous (continuous pump rate, like the IV-env PID)
-               anti-windup: |Ki * integral| <= 15 mg/kg/h (integral_limit = 15/Ki)
-               D filter: derivative_filter = 0.2 (EMA on de/dt)
-  dt = 5 s.  Fixed by hand (not tuned): OUTER_KI = 0.0008 ug/mL per BIS*s
-  (10 BIS of error for 1 min moves Ce_ref by ~0.5 ug/mL), OUTER_TRIM_CAP = 3.
+PID baseline for PropofolEnv -- BIS-ONLY feedback (v3, the default).
+  observes : measured BIS only (+ its own integral/derivative state). No Ce,
+             no Cp, no plant state -- exactly what a BIS monitor provides.
+  t = 0    : one 1 mg/kg induction bolus (env action BOLUS_ACTION; an action,
+             not an observation), then every 5 s:
+  e_pid    = measured_BIS - target_BIS     (positive = too light -> more drug)
+  rate     = PID(e_pid), clipped to [0, 40] mg/kg/h, via env.step_continuous
+  anti-windup: |Ki * integral| <= 30 mg/kg/h (integral_limit = 30 / Ki), so the
+             integrator can hold any maintenance rate in the patient ranges
+             (up to ~28 mg/kg/h for a young, resistant patient under
+             stimulation) but cannot wind past it
+  D filter : derivative_filter = 0.2 (EMA on de/dt, ~25 s) -- raw de/dt of
+             BIS with sigma=2 noise is otherwise pure noise
+  dt = 5 s
 
-Why cascade: BIS responds to infusion through a slow 3-compartment PK chain
-plus the ke0 lag, so a BIS-only PID either overshoots after induction or is
-sluggish. Closing the fast loop on Ce (which the TCI model provides) and only
-trimming the Ce setpoint from BIS is the standard closed-loop-anesthesia
-structure.
+FAIRNESS NOTE: the v2 baseline (CeCascadePID below, kept for reference only)
+closed its inner loop on the TCI-model effect-site concentration Ce. In this
+simulator there is no PK model error, so that Ce equals the true plant Ce --
+information no real BIS monitor gives. v3 removes it: the PID now sees only BIS.
 
-Tuning (scipy.optimize.minimize, Nelder-Mead over log10(Kp, Ki, Kd) of the inner loop):
+Tuning (scipy.optimize.minimize, Nelder-Mead over log10(Kp, Ki, Kd), 4 starts):
   plant     = NOMINAL Schnider patient only (age 53, 77 kg, 177 cm, male),
               nominal PD (Ce50=4.7, gamma=2.0), NO surgical stimuli, base target
-              profile (60 -> 50 ramp, no extra step), BIS noise ON (sigma=1.5,
-              fixed noise seed -> deterministic objective)
+              profile (60 -> 50 ramp, no extra step), BIS noise sigma=2.0 (the
+              robustness study's sensor noise; fixed noise seed)
   objective = J = dt * sum( |e| + 10 * du_penalty * |d level| ), i.e. IAE plus
               the RL reward's own smoothness term at the same relative weight
-  starts    = 4 initial guesses, best kept
 Tuned gains (python -m src.propofol_pid_tune --seed 0), hardcoded as TUNED_PID_GAINS:
-  Kp = 17.07 (mg/kg/h per ug/mL)   Ki = 0 (tuned to ~1e-111)   Kd = 789.5 (s)
-  -> effectively a PD inner loop; integral action lives in the outer BIS loop.
-  Kd is large because the inner loop differentiates the noise-free TCI Ce
-  (dCe/dt ~ 1e-3 ug/mL/s), not noisy BIS.
-  Nominal patient, nominal tuning episode: IAE = 9,585 BIS*s.
+  Kp = 0.4011 (mg/kg/h per BIS)   Ki = 0.003560 (/s)   Kd = 0 (tuned to 1.7e-13)
+  nominal IAE = 11,298 BIS*s (J = 12,245) -- effectively a PI controller
 Saves: results/propofol_pid_gains.json
 
 Usage:
@@ -54,56 +48,80 @@ from src.pid_controller import PIDController
 from src.propofol_environment import BISModel, PropofolEnv, NOMINAL_PATIENT
 from src.propofol_metrics import pad_history
 
-# Inner-loop gains from `python -m src.propofol_pid_tune --seed 0` (Nelder-Mead,
-# best of 4 starts, nominal J=9915 / IAE=9585). Ki is driven to ~1e-111 by
-# every start, i.e. the optimizer removes inner integral action: the outer
-# BIS loop is already an integrator (it trims Ce_ref until BIS error is zero),
-# so a second integrator on Ce only adds overshoot. Hardcoded as exactly 0.
-TUNED_PID_GAINS = dict(kp=17.0715, ki=0.0, kd=789.5324)
+# BIS-only PID gains from `python -m src.propofol_pid_tune --seed 0`: 3 of 4
+# Nelder-Mead starts converge to Kp=0.4011, Ki=0.003560, Kd=1.7e-13 (J=12,245,
+# nominal IAE=11,298 BIS*s). The optimizer switches the D term off: with BIS
+# noise sigma=2 even the filtered derivative costs more (jitter) than it buys,
+# so the tuned controller is effectively PI. Kd is hardcoded as exactly 0.
+TUNED_PID_GAINS = dict(kp=0.4011, ki=0.003560, kd=0.0)
 
-PID_INTEGRAL_TERM_CAP = 15.0     # mg/kg/h, inner-loop anti-windup
+PID_INTEGRAL_TERM_CAP = 30.0     # mg/kg/h, anti-windup on the integral term
 PID_DERIVATIVE_FILTER = 0.2      # EMA weight on de/dt (~25 s time constant at dt=5 s)
-OUTER_KI = 0.0008                # ug/mL per (BIS * s)
-OUTER_TRIM_CAP = 3.0             # ug/mL
+TUNING_NOISE_STD = 2.0
 
 
-class CascadePID:
-    """Induction bolus + outer BIS->Ce_ref trim + inner Ce->rate PID."""
+class BISPID:
+    """Induction bolus + PID on measured BIS only (the default PID baseline)."""
 
-    def __init__(self, env, kp, ki, kd, outer_ki=OUTER_KI, bolus=True):
+    def __init__(self, env, kp, ki, kd, bolus=True):
         self.env = env
         self.bolus = bolus
-        self.inner = PIDController(kp=kp, ki=ki, kd=kd, dt=env.dt, u_min=0.0,
-                                   u_max=env.MAX_RATE_MG_KG_H,
-                                   integral_limit=PID_INTEGRAL_TERM_CAP / ki if ki > 0 else 1e12,
-                                   derivative_filter=PID_DERIVATIVE_FILTER)
-        self.outer = PIDController(kp=0.0, ki=outer_ki, kd=0.0, dt=env.dt,
-                                   u_min=-OUTER_TRIM_CAP, u_max=OUTER_TRIM_CAP,
-                                   integral_limit=OUTER_TRIM_CAP / outer_ki)
+        self.pid = PIDController(kp=kp, ki=ki, kd=kd, dt=env.dt, u_min=0.0,
+                                 u_max=env.MAX_RATE_MG_KG_H,
+                                 integral_limit=PID_INTEGRAL_TERM_CAP / ki if ki > 0 else 1e12,
+                                 derivative_filter=PID_DERIVATIVE_FILTER)
         self.reset()
 
     def reset(self):
-        self.inner.reset()
-        self.outer.reset()
-        self.ce_ref = 0.0
+        self.pid.reset()
 
     def step(self):
         """Advance the env one step under PID control; returns env.step's tuple."""
         env = self.env
         if self.bolus and env.step_idx == 0:
             return env.step(env.BOLUS_ACTION)
-        trim = self.outer.compute(env.bis - env.target)
-        self.ce_ref = BISModel.nominal_ce_for_bis(env.target) + trim
-        rate = self.inner.compute(self.ce_ref - env.plant.Ce)
+        rate = self.pid.compute(env.bis - env.target)
         return env.step_continuous(rate)
 
 
+# app.py (frozen in the round that introduced BISPID) imports the name
+# `CascadePID`; it now resolves to the BIS-only controller so the dashboard
+# uses the fair baseline too.
+CascadePID = BISPID
+
+
+class CeCascadePID:
+    """v2 baseline, kept for reference only -- NOT used by default.
+    Bolus + outer BIS->Ce_ref I-trim + inner PID on (Ce_ref - Ce), where Ce is
+    the TCI-model effect-site concentration (== true plant Ce in this
+    simulator, i.e. information a BIS monitor does not provide).
+    v2 tuned gains: kp=17.0715, ki=0.0, kd=789.5324; outer_ki=0.0008, trim +/-3."""
+
+    V2_GAINS = dict(kp=17.0715, ki=0.0, kd=789.5324)
+
+    def __init__(self, env, kp, ki, kd, outer_ki=0.0008, trim_cap=3.0):
+        self.env = env
+        self.inner = PIDController(kp=kp, ki=ki, kd=kd, dt=env.dt, u_min=0.0,
+                                   u_max=env.MAX_RATE_MG_KG_H,
+                                   integral_limit=15.0 / ki if ki > 0 else 1e12,
+                                   derivative_filter=PID_DERIVATIVE_FILTER)
+        self.outer = PIDController(kp=0.0, ki=outer_ki, kd=0.0, dt=env.dt,
+                                   u_min=-trim_cap, u_max=trim_cap, integral_limit=trim_cap / outer_ki)
+
+    def step(self):
+        env = self.env
+        if env.step_idx == 0:
+            return env.step(env.BOLUS_ACTION)
+        ce_ref = BISModel.nominal_ce_for_bis(env.target) + self.outer.compute(env.bis - env.target)
+        return env.step_continuous(self.inner.compute(ce_ref - env.plant.Ce))
+
+
 def run_pid_episode(env, kp=None, ki=None, kd=None):
-    """One full PropofolEnv episode under cascade-PID control. Returns env.history."""
+    """One full PropofolEnv episode under BIS-only PID control. Returns env.history."""
     g = dict(TUNED_PID_GAINS)
     g.update({k: v for k, v in dict(kp=kp, ki=ki, kd=kd).items() if v is not None})
     env.reset()
-    pid = CascadePID(env, **g)
+    pid = BISPID(env, **g)
     done = False
     while not done:
         _, _, done, _ = pid.step()
@@ -112,7 +130,7 @@ def run_pid_episode(env, kp=None, ki=None, kd=None):
 
 def nominal_tuning_env(seed=0):
     return PropofolEnv(seed=seed, mode="eval", patient=NOMINAL_PATIENT, randomize_pd=False,
-                       stimuli=False, extra_target_steps=False)
+                       stimuli=False, extra_target_steps=False, bis_noise_std=TUNING_NOISE_STD)
 
 
 def nominal_cost(gains, seed=0):
@@ -139,8 +157,8 @@ def tune(seed=0, maxiter=300):
         kp, ki, kd = 10.0 ** np.asarray(log_g)
         return nominal_cost(dict(kp=kp, ki=ki, kd=kd), seed=seed)[0]
 
-    starts = [np.log10([2.0, 0.01, 10.0]), np.log10([5.0, 0.05, 1.0]),
-              np.log10([1.0, 0.002, 30.0]), np.log10([10.0, 0.02, 0.1])]
+    starts = [np.log10([0.5, 0.003, 5.0]), np.log10([1.5, 0.01, 1.0]),
+              np.log10([0.3, 0.001, 20.0]), np.log10([3.0, 0.005, 0.1])]
     best = None
     for x0 in starts:
         res = minimize(objective, x0, method="Nelder-Mead",
@@ -148,7 +166,7 @@ def tune(seed=0, maxiter=300):
         kp, ki, kd = 10.0 ** res.x
         iae = nominal_iae(dict(kp=kp, ki=ki, kd=kd), seed)
         print(f"  start {np.round(10.0 ** x0, 4)} -> Kp={kp:.4f} Ki={ki:.6f} Kd={kd:.4f}  "
-              f"J={res.fun:.1f}  IAE={iae:.1f}")
+              f"J={res.fun:.1f}  IAE={iae:.1f}", flush=True)
         if best is None or res.fun < best.fun:
             best = res
     kp, ki, kd = 10.0 ** best.x
@@ -163,14 +181,16 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=str, default="results/propofol_pid_gains.json")
     args = parser.parse_args()
 
-    print(f"Tuning cascade PID on the nominal Schnider patient {NOMINAL_PATIENT} (no stimuli, seed {args.seed})")
+    print(f"Tuning BIS-only PID on the nominal Schnider patient {NOMINAL_PATIENT} "
+          f"(no stimuli, noise sigma {TUNING_NOISE_STD}, seed {args.seed})")
     gains, iae = tune(seed=args.seed, maxiter=args.maxiter)
     print(f"\nBest: Kp={gains['kp']:.4f}  Ki={gains['ki']:.6f}  Kd={gains['kd']:.4f}  nominal IAE={iae:.1f}")
     print(f"Hardcoded default TUNED_PID_GAINS = {TUNED_PID_GAINS}  "
           f"(nominal IAE {nominal_iae(TUNED_PID_GAINS, seed=args.seed):.1f})")
     with open(args.out, "w") as f:
-        json.dump(dict(structure="cascade: bolus + BIS->Ce_ref (I-only) + Ce->rate PID",
-                       gains=gains, outer_ki=OUTER_KI, outer_trim_cap=OUTER_TRIM_CAP,
-                       integral_term_cap=PID_INTEGRAL_TERM_CAP, derivative_filter=PID_DERIVATIVE_FILTER,
-                       nominal_iae=iae, seed=args.seed, patient=NOMINAL_PATIENT), f, indent=2)
+        json.dump(dict(structure="BIS-only PID: 1 mg/kg bolus at t=0, then PID on (BIS - target)",
+                       gains=gains, integral_term_cap=PID_INTEGRAL_TERM_CAP,
+                       derivative_filter=PID_DERIVATIVE_FILTER, tuning_noise_std=TUNING_NOISE_STD,
+                       nominal_iae=iae, seed=args.seed, patient=NOMINAL_PATIENT,
+                       superseded_v2_ce_cascade=CeCascadePID.V2_GAINS), f, indent=2)
     print(f"Saved tuned gains to {args.out}")

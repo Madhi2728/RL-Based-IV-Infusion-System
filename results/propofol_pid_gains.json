@@ -1,20 +1,24 @@
 {
-  "structure": "cascade: bolus + BIS->Ce_ref (I-only) + Ce->rate PID",
+  "structure": "BIS-only PID: 1 mg/kg bolus at t=0, then PID on (BIS - target)",
   "gains": {
-    "kp": 17.07152289071578,
-    "ki": 1.3518287214742095e-111,
-    "kd": 789.5324026232931
+    "kp": 0.4011473956796526,
+    "ki": 0.0035595693376372197,
+    "kd": 1.703797809277488e-13
   },
-  "outer_ki": 0.0008,
-  "outer_trim_cap": 3.0,
-  "integral_term_cap": 15.0,
+  "integral_term_cap": 30.0,
   "derivative_filter": 0.2,
-  "nominal_iae": 9584.797793362912,
+  "tuning_noise_std": 2.0,
+  "nominal_iae": 11297.47632310173,
   "seed": 0,
   "patient": {
     "age": 53.0,
     "weight": 77.0,
     "height": 177.0,
     "sex": "male"
+  },
+  "superseded_v2_ce_cascade": {
+    "kp": 17.0715,
+    "ki": 0.0,
+    "kd": 789.5324
   }
 }

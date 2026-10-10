@@ -35,9 +35,16 @@ env are incompatible and are left untouched):
        results/propofol_v2_dqn_model.pt         + results/propofol_v2_dqn_training_curve.png
        (+ *_rewards.npy with the per-episode returns behind each curve)
 
+--obs ce|bis and --dist default|robust select the observation set and the
+training distribution (robustness study: --dist robust, see
+src/propofol_robustness.py). Non-default combinations save to
+results/propofol_<dist>_<obs>obs_<agent>_*.
+
 Usage:
     python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0
     python -m src.propofol_train --agent dqn --episodes 1500 --seed 0
+    python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0 --obs bis --dist robust
+    python -m src.propofol_train --agent dqn --episodes 1500 --seed 0 --obs bis --dist robust
 """
 
 import argparse
@@ -62,6 +69,22 @@ DECISION_EVERY = {"qlearning": 6, "dqn": 6}
 DQN_TRAIN_EVERY = 4
 MODEL_PATHS = {"qlearning": "results/propofol_v2_qlearning_qtable.pkl",
                "dqn": "results/propofol_v2_dqn_model.pt"}
+
+# Training distributions (--dist). "default" = the v2 env defaults (Ce50 +/-15 %,
+# BIS noise 1.5). "robust" = the robustness study's distribution (Ce50 +/-30 %,
+# BIS noise 2.0); stimuli are the train-mode 2-4 events, +15-30 %, 2-5 min in both.
+DISTRIBUTIONS = {"default": dict(),
+                 "robust": dict(ce50_jitter=0.30, bis_noise_std=2.0)}
+
+
+def model_prefix(agent_kind, obs="ce", dist="default", out_dir="results"):
+    tag = "v2" if (obs, dist) == ("ce", "default") else f"{dist}_{obs}obs"
+    return f"{out_dir}/propofol_{tag}_{agent_kind}"
+
+
+def model_path(agent_kind, obs="ce", dist="default", out_dir="results"):
+    ext = "_qtable.pkl" if agent_kind == "qlearning" else "_model.pt"
+    return model_prefix(agent_kind, obs, dist, out_dir) + ext
 
 
 class ActionHold:
@@ -124,8 +147,8 @@ def run_dqn_episode(env, agent, greedy=True, decision_every=DECISION_EVERY["dqn"
     return env.history, total_r
 
 
-def make_dqn_agent(n_actions, seed=None, **kw):
-    return DQNAgent(n_actions, state_dim=PROPOFOL_STATE_DIM, seed=seed, **kw)
+def make_dqn_agent(n_actions, seed=None, state_dim=PROPOFOL_STATE_DIM, **kw):
+    return DQNAgent(n_actions, state_dim=state_dim, seed=seed, **kw)
 
 
 def eps_decay_for(n_episodes, eps_end=0.05, frac=0.7):
@@ -148,11 +171,11 @@ def _save_curve(ep_rewards, title, path):
 
 
 def train(agent_kind="qlearning", n_episodes=None, seed=0, out_dir="results", log_every=None,
-          decision_every=None):
+          decision_every=None, obs="ce", dist="default"):
     n_episodes = n_episodes or DEFAULT_EPISODES[agent_kind]
     k = decision_every or DECISION_EVERY[agent_kind]
     log_every = log_every or max(1, n_episodes // 20)
-    env = PropofolEnv(seed=seed, mode="train")
+    env = PropofolEnv(seed=seed, mode="train", obs_mode=obs, **DISTRIBUTIONS[dist])
     decay = eps_decay_for(n_episodes)
     if agent_kind == "qlearning":
         agent = QLearningAgent(env.n_states, env.n_actions, eps_decay=decay, seed=seed)
@@ -161,7 +184,7 @@ def train(agent_kind="qlearning", n_episodes=None, seed=0, out_dir="results", lo
         # the tiny MLP is faster single-threaded (thread overhead dominates at
         # batch 64); speed only, results are unaffected
         torch.set_num_threads(1)
-        agent = make_dqn_agent(env.n_actions, seed=seed, eps_decay=decay)
+        agent = make_dqn_agent(env.n_actions, seed=seed, state_dim=env.state_dim, eps_decay=decay)
         run = run_dqn_episode
     else:
         raise ValueError(f"unknown agent {agent_kind!r}")
@@ -176,13 +199,14 @@ def train(agent_kind="qlearning", n_episodes=None, seed=0, out_dir="results", lo
             print(f"episode {ep+1}/{n_episodes}  avg_reward(last{log_every})={recent:.2f}  eps={agent.eps:.3f}",
                   flush=True)
 
-    prefix = f"{out_dir}/propofol_v2_{agent_kind}"
-    model_path = f"{prefix}_qtable.pkl" if agent_kind == "qlearning" else f"{prefix}_model.pt"
-    agent.save(model_path)
+    prefix = model_prefix(agent_kind, obs, dist, out_dir)
+    path = model_path(agent_kind, obs, dist, out_dir)
+    agent.save(path)
     np.save(f"{prefix}_rewards.npy", np.array(ep_rewards))
     label = "Q-learning" if agent_kind == "qlearning" else "DQN"
-    _save_curve(ep_rewards, f"Propofol {label} training convergence (v2 env)", f"{prefix}_training_curve.png")
-    print(f"Saved {model_path} and curve to {prefix}_training_curve.png")
+    _save_curve(ep_rewards, f"Propofol {label} training convergence (obs={obs}, dist={dist})",
+                f"{prefix}_training_curve.png")
+    print(f"Saved {path} and curve to {prefix}_training_curve.png")
     return agent, ep_rewards
 
 
@@ -196,6 +220,10 @@ if __name__ == "__main__":
                         help="where the model + training curve are written (default results/)")
     parser.add_argument("--decision_every", type=int, default=None,
                         help="env steps per agent decision (default: DECISION_EVERY[agent])")
+    parser.add_argument("--obs", choices=["ce", "bis"], default="ce",
+                        help="ce: v2 observations incl. TCI Ce; bis: BIS-derived features only")
+    parser.add_argument("--dist", choices=list(DISTRIBUTIONS), default="default",
+                        help="default: v2 env (Ce50 +/-15 %%, noise 1.5); robust: Ce50 +/-30 %%, noise 2")
     args = parser.parse_args()
     train(agent_kind=args.agent, n_episodes=args.episodes, seed=args.seed, out_dir=args.out_dir,
-          decision_every=args.decision_every)
+          decision_every=args.decision_every, obs=args.obs, dist=args.dist)
