@@ -2,14 +2,16 @@
 propofol_pid_tune.py
 ---------------------
 
-PID baseline for PropofolEnv, reusing src/pid_controller.PIDController as-is.
+PID baseline for PropofolEnv, reusing src/pid_controller.PIDController.
   e_pid  = measured_BIS - target_BIS      (positive = too light -> more drug;
                                            the env's own error is target - BIS)
-  output = continuous infusion rate, clipped to [0, 12] mg/kg/h
+  output = continuous infusion rate, clipped to [0, 30] mg/kg/h
            (driven through env.step_continuous, like evaluate.py's IV PID that
             commands a continuous pump rate instead of the RL's discrete actions)
-  dt = 5 s, integral_limit = 12 / Ki  (integral term alone can span the full
-           output range, no further)
+  dt = 5 s
+  anti-windup: integral_limit = 15 / Ki -> |Ki * integral| <= 15 mg/kg/h
+  D filter   : derivative_filter = 0.2 (EMA on de/dt; BIS noise sigma=2 per 5 s
+               sample otherwise makes the raw D term pure noise)
 
 Tuning (scipy.optimize.minimize, Nelder-Mead over log10(Kp, Ki, Kd)):
   plant     = NOMINAL Schnider patient only (age 53, 77 kg, 177 cm, male),
@@ -44,9 +46,21 @@ from src.propofol_metrics import pad_history
 TUNED_PID_GAINS = dict(kp=1.4005, ki=0.005901, kd=0.1112)
 
 
+# Anti-windup: the integral TERM (Ki * integral) is clamped to +/-15 mg/kg/h --
+# enough to hold any maintenance rate in the patient ranges (nominal ~8-10,
+# resistant patient under stimulation ~14) but well under the 30 mg/kg/h
+# output ceiling, so induction (output pinned at 30 for minutes) cannot wind
+# the integrator up to the full output range. The old setting
+# (integral_limit = u_max / Ki) technically clamped but let the integral alone
+# reach u_max, i.e. no effective anti-windup.
+PID_INTEGRAL_TERM_CAP = 15.0     # mg/kg/h
+PID_DERIVATIVE_FILTER = 0.2      # EMA weight on de/dt (~25 s time constant at dt=5 s)
+
+
 def make_pid(env, kp, ki, kd):
     return PIDController(kp=kp, ki=ki, kd=kd, dt=env.dt, u_min=0.0, u_max=env.MAX_RATE_MG_KG_H,
-                         integral_limit=env.MAX_RATE_MG_KG_H / ki if ki > 0 else 1e12)
+                         integral_limit=PID_INTEGRAL_TERM_CAP / ki if ki > 0 else 1e12,
+                         derivative_filter=PID_DERIVATIVE_FILTER)
 
 
 def run_pid_episode(env, kp=None, ki=None, kd=None):
@@ -70,16 +84,28 @@ def nominal_tuning_env(seed=0):
                        stimuli=False, extra_target_steps=False)
 
 
-def nominal_iae(gains, seed=0):
+def nominal_cost(gains, seed=0):
+    """(objective, IAE) on the nominal tuning episode.
+    objective = IAE + smoothness, weighted exactly like the RL reward's
+    tracking vs smoothness terms (|e|/10 vs du_penalty*|d level| per step):
+        J = dt * sum( |e| + 10 * du_penalty * |d level_frac| )"""
     env = nominal_tuning_env(seed)
-    hist = pad_history(run_pid_episode(env, **gains), env.n_steps, env.dt)
-    return float(sum(abs(h["error"]) for h in hist) * env.dt)
+    raw = run_pid_episode(env, **gains)
+    hist = pad_history(raw, env.n_steps, env.dt)
+    iae = float(sum(abs(h["error"]) for h in hist) * env.dt)
+    levels = np.interp([h["rate_mg_kg_h"] for h in raw], env.RATE_LEVELS_MG_KG_H, np.arange(env.n_levels))
+    tv = float(np.abs(np.diff(np.concatenate([[0.0], levels]))).sum())
+    return iae + 10.0 * env.du_penalty * tv * env.dt, iae
+
+
+def nominal_iae(gains, seed=0):
+    return nominal_cost(gains, seed)[1]
 
 
 def tune(seed=0, maxiter=300):
     def objective(log_g):
         kp, ki, kd = 10.0 ** np.asarray(log_g)
-        return nominal_iae(dict(kp=kp, ki=ki, kd=kd), seed=seed)
+        return nominal_cost(dict(kp=kp, ki=ki, kd=kd), seed=seed)[0]
 
     starts = [np.log10([0.3, 0.005, 1.0]), np.log10([1.0, 0.01, 0.1]),
               np.log10([0.1, 0.001, 5.0]), np.log10([0.5, 0.002, 0.01])]
@@ -88,11 +114,14 @@ def tune(seed=0, maxiter=300):
         res = minimize(objective, x0, method="Nelder-Mead",
                        options=dict(maxiter=maxiter, xatol=1e-3, fatol=1.0))
         kp, ki, kd = 10.0 ** res.x
-        print(f"  start {np.round(10.0 ** x0, 4)} -> Kp={kp:.4f} Ki={ki:.6f} Kd={kd:.4f}  IAE={res.fun:.1f}")
+        iae = nominal_iae(dict(kp=kp, ki=ki, kd=kd), seed)
+        print(f"  start {np.round(10.0 ** x0, 4)} -> Kp={kp:.4f} Ki={ki:.6f} Kd={kd:.4f}  "
+              f"J={res.fun:.1f}  IAE={iae:.1f}")
         if best is None or res.fun < best.fun:
             best = res
     kp, ki, kd = 10.0 ** best.x
-    return dict(kp=float(kp), ki=float(ki), kd=float(kd)), float(best.fun)
+    gains = dict(kp=float(kp), ki=float(ki), kd=float(kd))
+    return gains, nominal_iae(gains, seed)
 
 
 if __name__ == "__main__":

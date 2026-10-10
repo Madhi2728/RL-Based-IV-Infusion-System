@@ -42,14 +42,19 @@ RL environment (PropofolEnv)
               dBIS/dt   = slope of EMA-filtered BIS (alpha 0.15), BIS/min
   bins    = 15 x 7 x 8 = 840 states
   clips   = |BIS_error| 30.0, |dBIS/dt| 10.0 BIS/min, level = action index 0..7
-  actions = 8 ABSOLUTE infusion levels, linspace(0, 12, 8) mg/kg/h
+  actions = 8 ABSOLUTE infusion levels [0, 3, 6, 8, 10, 13, 18, 30] mg/kg/h
             -> self.ACTIONS in mg/s for the current patient's weight
+            (originally linspace(0, 12, 8): too little authority -- at 12
+             mg/kg/h the nominal patient needs ~11 min to reach BIS 50 and a
+             Ce50+25 % patient under stimulus can never get there; see DESIGN.md)
   episode = 3600 s = 720 steps (dt=5 s); done early if measured BIS < 20
   target  = 60 for 0-10 min (induction), linear ramp 60->50 over 10-15 min,
             50 thereafter; with p=0.5 one extra step at t ~ U(25, 50) min to
             50 +/- U(5, 10) (stays inside 40-60) held to episode end
-  reward  = -|e|/10 - 5*[BIS < 35 or BIS > 65] - 0.02*|d rate (mg/kg/h)|
+  reward  = -|e|/10 - 5*[BIS < 35 or BIS > 65] - 0.1*|d level|
             - 200 on early termination (BIS < 20)
+            (d level = change in action-level index, fractional for PID's
+             continuous rate; same spirit as IVInfusionEnv's -0.02*|du|)
   DQN obs = continuous_state(): [BIS, BIS_error, dBIS/dt, Ce, Cp, last_rate,
             target_BIS] normalized -> PROPOFOL_STATE_DIM = 7
 
@@ -200,14 +205,14 @@ class BISModel:
     CE50 = 4.7
     GAMMA = 2.0
 
-    def __init__(self, ce50=CE50, gamma=GAMMA, noise_std=2.0, rng=None):
+    def __init__(self, ce50=CE50, gamma=GAMMA, noise_std=1.5, rng=None):
         self.ce50 = float(ce50)
         self.gamma = float(gamma)
         self.noise_std = float(noise_std)
         self.rng = rng if rng is not None else np.random.default_rng()
 
-    def jitter(self, rng, ce50_frac=0.25, gamma_frac=0.20):
-        """Draw this episode's patient sensitivity: Ce50 +/-25 %, gamma +/-20 %."""
+    def jitter(self, rng, ce50_frac=0.15, gamma_frac=0.20):
+        """Draw this episode's patient sensitivity: Ce50 +/-15 %, gamma +/-20 %."""
         self.ce50 = self.CE50 * rng.uniform(1.0 - ce50_frac, 1.0 + ce50_frac)
         self.gamma = self.GAMMA * rng.uniform(1.0 - gamma_frac, 1.0 + gamma_frac)
 
@@ -218,6 +223,14 @@ class BISModel:
         ce50_eff = self.ce50 * (1.0 + ce50_shift)
         ce_g = max(ce, 0.0) ** self.gamma
         return self.E0 - self.EMAX * ce_g / (ce50_eff ** self.gamma + ce_g)
+
+    @classmethod
+    def nominal_ce_for_bis(cls, bis):
+        """Inverse of the NOMINAL curve (Ce50=4.7, gamma=2): the Ce that gives
+        `bis` in a typical patient. Used by the cascade PID's outer loop."""
+        bis = _clip(float(bis), 1.0, cls.E0 - 1e-6)
+        frac = (cls.E0 - bis) / cls.EMAX            # = Ce^g / (Ce50^g + Ce^g)
+        return cls.CE50 * (frac / (1.0 - frac)) ** (1.0 / cls.GAMMA)
 
     def measure(self, ce, ce50_shift=0.0):
         bis = self.true_bis(ce, ce50_shift)
@@ -297,24 +310,27 @@ class PropofolEnv:
         level = index of the last infusion level (0..7)
       -> single integer state index
 
-    ACTION: index into RATE_LEVELS_MG_KG_H = linspace(0, 12, 8) mg/kg/h.
+    ACTION: index into RATE_LEVELS_MG_KG_H = [0, 3, 6, 8, 10, 13, 18, 30] mg/kg/h.
       NOTE: absolute rate levels, NOT deltas like IVInfusionEnv.ACTIONS --
       propofol pumps are commanded with an absolute rate, and a delta action
       would add an integrator the agent has to undo. self.ACTIONS holds the
       same levels converted to mg/s for the current patient's weight.
+      Non-uniform on purpose: 2 mg/kg/h resolution over the nominal
+      maintenance range (6-10), 13/18 for resistant patients / stimulation,
+      30 as the induction "push" level (no separate bolus action).
 
-    REWARD: -|e|/10 - 5*(BIS<35 or BIS>65) - 0.02*|d rate| (- 200 if BIS<20)
+    REWARD: -|e|/10 - 5*(BIS<35 or BIS>65) - 0.1*|d level| (- 200 if BIS<20)
     """
 
-    RATE_LEVELS_MG_KG_H = np.linspace(0.0, 12.0, 8)
-    MAX_RATE_MG_KG_H = 12.0
+    RATE_LEVELS_MG_KG_H = np.array([0.0, 3.0, 6.0, 8.0, 10.0, 13.0, 18.0, 30.0])
+    MAX_RATE_MG_KG_H = 30.0
     CONC_SCALE = 5.0  # ug/mL, ~Ce50, normalizes Ce/Cp for DQN
 
     def __init__(self, dt=5.0, episode_len=3600.0, seed=None, mode="train",
                  err_bins=15, dbis_bins=7, err_clip=30.0, dbis_clip=10.0,
                  bis_noise_std=2.0, dbis_filter_alpha=0.15,
                  patient=None, randomize_pd=True, stimuli=True, extra_target_steps=True,
-                 du_penalty=0.02, terminal_penalty=200.0, terminate_bis=20.0):
+                 du_penalty=0.1, terminal_penalty=200.0, terminate_bis=20.0):
         self.dt = float(dt)
         self.episode_len = float(episode_len)
         self.n_steps = int(round(episode_len / dt))
@@ -399,6 +415,7 @@ class PropofolEnv:
         self.err = self.target - self.bis
         self.last_rate = 0.0
         self.last_level = 0
+        self.last_level_frac = 0.0
         self.total_drug_mg = 0.0
         return self._discretize(self.err, self.dbis, self.last_level)
 
@@ -430,16 +447,18 @@ class PropofolEnv:
     def step(self, action_idx):
         """Discrete action: absolute infusion level index (RL agents)."""
         action_idx = int(action_idx)
-        return self._advance(float(self.RATE_LEVELS_MG_KG_H[action_idx]), action_idx)
+        return self._advance(float(self.RATE_LEVELS_MG_KG_H[action_idx]), action_idx, float(action_idx))
 
     def step_continuous(self, rate_mg_kg_h):
-        """Continuous infusion rate in mg/kg/h (PID baseline), clipped to [0, 12].
+        """Continuous infusion rate in mg/kg/h (PID baseline), clipped to [0, 30].
         Same dynamics/reward as step(); the state's level feature uses the
-        nearest discrete level."""
+        nearest discrete level, the smoothness penalty the fractional level
+        (rate interpolated onto the level-index scale)."""
         rate = _clip(float(rate_mg_kg_h), 0.0, self.MAX_RATE_MG_KG_H)
-        return self._advance(rate, self.nearest_level(rate))
+        level_frac = float(np.interp(rate, self.RATE_LEVELS_MG_KG_H, np.arange(self.n_levels)))
+        return self._advance(rate, self.nearest_level(rate), level_frac)
 
-    def _advance(self, rate_mg_kg_h, level):
+    def _advance(self, rate_mg_kg_h, level, level_frac):
         u = rate_mg_kg_h * self.patient["weight"] / 3600.0  # mg/s
         self.target = float(self.target_schedule[self.step_idx])
         shift = float(self.stim_shift[self.step_idx])
@@ -452,7 +471,7 @@ class PropofolEnv:
         self.bis_filt = prev_filt + self.dbis_filter_alpha * (bis - prev_filt)
         self.dbis = (self.bis_filt - prev_filt) / self.dt * 60.0  # BIS/min
         err = self.target - bis
-        du = rate_mg_kg_h - self.last_rate
+        du = level_frac - self.last_level_frac  # change in action level (smoothness)
 
         terminated = bis < self.terminate_bis
         reward = -abs(err) / 10.0
@@ -471,7 +490,7 @@ class PropofolEnv:
         ))
 
         self.bis, self.err = bis, err
-        self.last_rate, self.last_level = rate_mg_kg_h, level
+        self.last_rate, self.last_level, self.last_level_frac = rate_mg_kg_h, level, level_frac
         self.step_idx += 1
         truncated = self.step_idx >= self.n_steps
         done = terminated or truncated

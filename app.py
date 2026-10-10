@@ -12,8 +12,9 @@ below, unchanged) or "Propofol (Schnider)" (render_propofol_dashboard():
 PropofolSimController x3 on PropofolEnv, BIS / Ce / infusion-rate charts,
 patient sliders, live "Simulate surgical stimulus"; frozen models
 results/propofol_qlearning_qtable.pkl and results/propofol_dqn_model.pt;
-PID gains = TUNED_PID_GAINS; no metrics tables in this mode -- batch numbers
-live in results/propofol_eval_summary.json from src/propofol_evaluate.py).
+PID gains = TUNED_PID_GAINS; live this-episode metrics table via
+src/propofol_metrics.py; no batch table in this mode -- batch numbers live in
+results/propofol_eval_summary.json from src/propofol_evaluate.py).
 Streamlit app: live side-by-side comparison of PID, tabular Q-learning, and
 DQN control of the simulated IV infusion line (src/environment.py).
 
@@ -332,7 +333,6 @@ SIM_PROPOFOL = "Propofol (Schnider)"
 
 PF_QTABLE_PATH = "results/propofol_qlearning_qtable.pkl"
 PF_DQN_PATH = "results/propofol_dqn_model.pt"
-PF_SUMMARY_PATH = "results/propofol_eval_summary.json"
 PF_DT = 5.0                 # s per control step, matches PropofolEnv
 PF_STEPS_PER_TICK = 6       # 30 simulated seconds per screen refresh
 PF_SAFE_BAND = (40.0, 60.0)
@@ -581,6 +581,11 @@ def render_propofol_dashboard():
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
                                    "Infusion (mg/kg/h)", rename_suffix=" rate")
         st.altair_chart(add_event_markers(rate_chart, events), width="stretch", key="pf_rate_chart")
+
+        st.subheader("Table 1 - Performance Metrics (this episode)")
+        st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
+                   "total propofol.")
+        st.dataframe(pf_live_metrics(ss), width="stretch")
     else:
         st.info("Click **START** to run, or **Reset episode** in the sidebar to apply new settings.")
 
