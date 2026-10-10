@@ -10,10 +10,10 @@ Batch metrics shown come from results/eval_summary.json.
 Sidebar "Simulator" selectbox: "IV Flow Control" (default, the dashboard
 below, unchanged) or "Propofol (Schnider)" (render_propofol_dashboard():
 PropofolSimController x3 on PropofolEnv, BIS / Ce / infusion-rate charts,
-patient sliders, live "Simulate surgical stimulus", metrics via
-src/propofol_metrics.py; frozen models results/propofol_qlearning_qtable.pkl
-and results/propofol_dqn_model.pt; batch table from
-results/propofol_eval_summary.json; PID gains = TUNED_PID_GAINS).
+patient sliders, live "Simulate surgical stimulus"; frozen models
+results/propofol_qlearning_qtable.pkl and results/propofol_dqn_model.pt;
+PID gains = TUNED_PID_GAINS; no metrics tables in this mode -- batch numbers
+live in results/propofol_eval_summary.json from src/propofol_evaluate.py).
 Streamlit app: live side-by-side comparison of PID, tabular Q-learning, and
 DQN control of the simulated IV infusion line (src/environment.py).
 
@@ -581,23 +581,6 @@ def render_propofol_dashboard():
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
                                    "Infusion (mg/kg/h)", rename_suffix=" rate")
         st.altair_chart(add_event_markers(rate_chart, events), width="stretch", key="pf_rate_chart")
-
-        st.subheader("Table 1 - Performance Metrics (this episode)")
-        st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
-                   "total propofol.")
-        st.dataframe(pf_live_metrics(ss), width="stretch")
-
-        batch = load_batch_summary(PF_SUMMARY_PATH)
-        st.subheader("Table 2 - Performance Metrics (batch evaluation)")
-        if batch is None:
-            st.info(f"No batch summary found at `{PF_SUMMARY_PATH}` -- run "
-                    "`python -m src.propofol_evaluate --n_eval 50` to generate it.")
-        else:
-            st.caption(f"Averaged over {batch['n_eval']} randomized test patients with random "
-                       "surgical stimuli (src/propofol_evaluate.py).")
-            table = batch_summary_table(batch)
-            table = table.reindex([r for r in PF_METRIC_ROWS if r in table.index])
-            st.dataframe(table.rename(index=PF_METRIC_ROWS), width="stretch")
     else:
         st.info("Click **START** to run, or **Reset episode** in the sidebar to apply new settings.")
 
