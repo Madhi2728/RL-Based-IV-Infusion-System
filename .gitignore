@@ -5,3 +5,6 @@ __pycache__/
 *.pt
 !results/qlearning_qtable.pkl
 !results/dqn_model.pt
+!results/propofol_qlearning_qtable.pkl
+!results/propofol_dqn_model.pt
+.pytest_cache/

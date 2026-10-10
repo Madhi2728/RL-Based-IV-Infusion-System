@@ -7,6 +7,13 @@ Q-table (results/qlearning_qtable.pkl) and DQN weights (results/dqn_model.pt)
 are frozen: loaded from results/, never trained or updated here.
 PID, Q and DQN all run on the same simulated line (IVInfusionPlant, delay_steps=10).
 Batch metrics shown come from results/eval_summary.json.
+Sidebar "Simulator" selectbox: "IV Flow Control" (default, the dashboard
+below, unchanged) or "Propofol (Schnider)" (render_propofol_dashboard():
+PropofolSimController x3 on PropofolEnv, BIS / Ce / infusion-rate charts,
+patient sliders, live "Simulate surgical stimulus", metrics via
+src/propofol_metrics.py; frozen models results/propofol_qlearning_qtable.pkl
+and results/propofol_dqn_model.pt; batch table from
+results/propofol_eval_summary.json; PID gains = TUNED_PID_GAINS).
 Streamlit app: live side-by-side comparison of PID, tabular Q-learning, and
 DQN control of the simulated IV infusion line (src/environment.py).
 
@@ -30,6 +37,10 @@ from src.environment import IVInfusionPlant
 from src.pid_controller import PIDController
 from src.q_learning_agent import QLearningAgent
 from src.dqn_agent import DQNAgent, KEffEstimator, _normalize_state
+from src.propofol_environment import PropofolEnv
+from src.propofol_metrics import compute_propofol_metrics
+from src.propofol_pid_tune import TUNED_PID_GAINS, make_pid
+from src.propofol_train import make_dqn_agent
 
 st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", layout="wide")
 
@@ -70,6 +81,7 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
 EVENT_STYLE = {
     "occlusion": {"color": "orange", "label": "Blockage"},
     "pressure": {"color": "purple", "label": "Bag/arm bump"},
+    "stimulus": {"color": "red", "label": "Surgical stimulus"},  # propofol mode
 }
 
 
@@ -309,7 +321,298 @@ def step_all():
     ss.t += 1
 
 
+# ===========================================================================
+# Propofol (Schnider) mode -- an additive second simulator. Everything below
+# uses its own "pf_"-prefixed session-state keys, so switching modes never
+# touches the IV-flow session above. Selected via the sidebar "Simulator" box;
+# the IV-flow dashboard further down is unchanged and remains the default.
+# ===========================================================================
+SIM_IV = "IV Flow Control"
+SIM_PROPOFOL = "Propofol (Schnider)"
+
+PF_QTABLE_PATH = "results/propofol_qlearning_qtable.pkl"
+PF_DQN_PATH = "results/propofol_dqn_model.pt"
+PF_SUMMARY_PATH = "results/propofol_eval_summary.json"
+PF_DT = 5.0                 # s per control step, matches PropofolEnv
+PF_STEPS_PER_TICK = 6       # 30 simulated seconds per screen refresh
+PF_SAFE_BAND = (40.0, 60.0)
+PF_BIS_Y_DOMAIN = (0, 100)
+PF_CE_Y_DOMAIN = (0, 8)
+PF_RATE_Y_DOMAIN = (0, 12.5)
+
+PF_METRIC_ROWS = {
+    "time_in_target_pct": "Time in target (+-5 BIS) %",
+    "pct_bis_below_40": "% time BIS < 40 (too deep)",
+    "pct_bis_above_60": "% time BIS > 60 (too light)",
+    "IAE": "Total tracking error (IAE, BIS*s)",
+    "total_propofol_mg": "Total propofol delivered (mg)",
+}
+
+
+@st.cache_resource
+def load_propofol_qlearning_agent(path=PF_QTABLE_PATH):
+    probe = PropofolEnv()
+    agent = QLearningAgent(probe.n_states, probe.n_actions)
+    agent.load(path)
+    return agent
+
+
+@st.cache_resource
+def load_propofol_dqn_agent(path=PF_DQN_PATH):
+    agent = make_dqn_agent(PropofolEnv().n_actions)
+    agent.load(path)
+    return agent
+
+
+class PropofolSimController:
+    """Propofol counterpart of SimController: wraps one controller (PID /
+    Q-learning / DQN) driving its own PropofolEnv. All three envs are built
+    from the same seed and patient, so they share the same PD sensitivity
+    (Ce50, gamma) and BIS-noise sequence; stimuli are applied live by the app
+    to every controller identically. The target is held flat at the chosen
+    BIS (the env's 60->50 training profile is overridden)."""
+
+    def __init__(self, kind, seed, patient, target_bis, episode_len_s, agent=None):
+        self.kind = kind
+        self.agent = agent
+        self.env = PropofolEnv(seed=seed, mode="eval", patient=patient, stimuli=False,
+                               extra_target_steps=False, episode_len=episode_len_s)
+        self.env.reset()
+        self.env.target_schedule[:] = target_bis
+        self.env.target = float(target_bis)
+        self.env.err = self.env.target - self.env.bis
+        self.state = self.env._discretize(self.env.err, self.env.dbis, self.env.last_level)
+        self.done = False
+        if kind == "pid":
+            self.pid = make_pid(self.env, **TUNED_PID_GAINS)
+            self.pid.reset()
+
+    def step(self, stim_shift):
+        if self.done:
+            return None
+        env = self.env
+        env.stim_shift[env.step_idx] = stim_shift
+        if self.kind == "pid":
+            rate = self.pid.compute(env.bis - env.target)
+            self.state, _, self.done, _ = env.step_continuous(rate)
+        elif self.kind == "qlearning":
+            a = self.agent.select_action(self.state, greedy=True)
+            self.state, _, self.done, _ = env.step(a)
+        elif self.kind == "dqn":
+            a = self.agent.select_action(env.continuous_state(), greedy=True)
+            self.state, _, self.done, _ = env.step(a)
+        return env.history[-1]
+
+
+def pf_init_session(seed, patient, target_bis, episode_min, ql_agent, dqn_agent):
+    episode_len_s = episode_min * 60.0
+    controllers = {"PID (classic controller)": PropofolSimController(
+        "pid", seed, patient, target_bis, episode_len_s)}
+    if ql_agent is not None:
+        controllers["Q-learning (RL)"] = PropofolSimController(
+            "qlearning", seed, patient, target_bis, episode_len_s, agent=ql_agent)
+    if dqn_agent is not None:
+        controllers["DQN (RL)"] = PropofolSimController(
+            "dqn", seed, patient, target_bis, episode_len_s, agent=dqn_agent)
+    ss = st.session_state
+    ss.pf_controllers = controllers
+    ss.pf_t = 0
+    ss.pf_n_steps = int(episode_len_s / PF_DT)
+    ss.pf_target = float(target_bis)
+    ss.pf_stim_until = -1
+    ss.pf_stim_shift = 0.0
+    ss.pf_rows = []
+    ss.pf_events = []
+
+
+def pf_step_all():
+    ss = st.session_state
+    for _ in range(PF_STEPS_PER_TICK):
+        if ss.pf_t >= ss.pf_n_steps:
+            ss.pf_auto_running = False
+            return
+        shift = ss.pf_stim_shift if ss.pf_t < ss.pf_stim_until else 0.0
+        row = {"t": ss.pf_t * PF_DT / 60.0, "target": ss.pf_target, "stimulus": shift}
+        for name, ctrl in ss.pf_controllers.items():
+            h = ctrl.step(shift)
+            row[f"{name} BIS"] = h["measured"] if h else np.nan
+            row[f"{name} Ce"] = h["ce"] if h else np.nan
+            row[f"{name} rate"] = h["rate_mg_kg_h"] if h else np.nan
+        ss.pf_rows.append(row)
+        ss.pf_t += 1
+
+
+def pf_line_chart(df, cols, y_domain, y_title, rename_suffix=""):
+    """Like fixed_range_line_chart, but time in minutes and series labels
+    stripped of the per-chart suffix (" BIS" / " Ce" / " rate")."""
+    long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
+    if rename_suffix:
+        long_df["series"] = long_df["series"].str.replace(rename_suffix, "", regex=False)
+    return (
+        alt.Chart(long_df)
+        .mark_line()
+        .encode(
+            x=alt.X("t", title="Time (min)"),
+            y=alt.Y("value", title=y_title, scale=alt.Scale(domain=list(y_domain), clamp=True)),
+            color=alt.Color("series", title=None),
+        )
+    )
+
+
+def pf_bis_chart(df, names, events):
+    band = (
+        alt.Chart(pd.DataFrame({"lo": [PF_SAFE_BAND[0]], "hi": [PF_SAFE_BAND[1]]}))
+        .mark_rect(color="green", opacity=0.10)
+        .encode(y=alt.Y("lo:Q", scale=alt.Scale(domain=list(PF_BIS_Y_DOMAIN))), y2="hi:Q")
+    )
+    lines = pf_line_chart(df, ["target"] + [f"{n} BIS" for n in names], PF_BIS_Y_DOMAIN,
+                          "BIS (40-60 safe band shaded)", rename_suffix=" BIS")
+    return add_event_markers(alt.layer(band, lines), events)
+
+
+def pf_live_metrics(ss):
+    rows = {}
+    for name, ctrl in ss.pf_controllers.items():
+        hist = ctrl.env.history
+        if not hist:
+            continue
+        # n_steps = elapsed steps: a controller that ended the episode early
+        # (BIS < 20) is scored as staying there up to "now"
+        m = compute_propofol_metrics(hist, [], max(ss.pf_t, len(hist)), PF_DT)
+        rows[name] = {label: m[key] for key, label in PF_METRIC_ROWS.items()}
+    return pd.DataFrame(rows).round(1)
+
+
+def render_propofol_dashboard():
+    ss = st.session_state
+    st.title("Propofol Anesthesia Control: PID vs Q-learning vs DQN")
+    if "pf_auto_running" not in ss:
+        ss.pf_auto_running = False
+
+    st.markdown(
+        """
+        <style>
+        div.st-key-pf_start_stop_controls button[kind="primary"] {
+            background-color: #d32f2f; border-color: #d32f2f; color: white;
+        }
+        div.st-key-pf_start_stop_controls button[kind="primary"]:hover {
+            background-color: #b71c1c; border-color: #b71c1c; color: white;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="pf_start_stop_controls"):
+        col_start, col_stop, _col_spacer = st.columns([1, 1, 4])
+        if col_start.button("START", type="primary", key="pf_start"):
+            ss.pf_auto_running = True
+        if col_stop.button("STOP", type="primary", key="pf_stop"):
+            ss.pf_auto_running = False
+
+    with st.sidebar:
+        st.header("Setup")
+        target_bis = st.slider("Target BIS", 40, 60, 50, step=1,
+                               help="Depth-of-anesthesia target. 40-60 is the usual general-anesthesia band.")
+        episode_min = st.slider("Episode length (minutes)", 10, 60, 30, step=5)
+        seed = st.number_input(
+            "Repeat-test number", value=0, step=1, key="pf_seed",
+            help="Same number = identical patient sensitivity (Ce50, gamma) and BIS "
+                 "sensor noise for all three controllers. (Random seed)",
+        )
+        st.subheader("Patient")
+        age = st.slider("Age (years)", 20, 80, 53)
+        weight = st.slider("Weight (kg)", 50, 110, 77)
+        height = st.slider("Height (cm)", 150, 195, 177)
+        sex = st.radio("Sex", ["male", "female"], horizontal=True)
+        st.caption("Defaults = the Schnider reference patient (53 y, 77 kg, 177 cm, male).")
+
+        ql_agent, dqn_agent = None, None
+        try:
+            ql_agent = load_propofol_qlearning_agent()
+        except FileNotFoundError:
+            st.warning(f"No trained propofol Q-table found at {PF_QTABLE_PATH} -- run "
+                       "`python -m src.propofol_train --agent qlearning --episodes 3000 --seed 0` first.")
+        try:
+            dqn_agent = load_propofol_dqn_agent()
+        except FileNotFoundError:
+            st.warning(f"No trained propofol DQN model found at {PF_DQN_PATH} -- run "
+                       "`python -m src.propofol_train --agent dqn --episodes 600 --seed 0` first.")
+
+        patient = dict(age=float(age), weight=float(weight), height=float(height), sex=sex)
+        if st.button("Reset episode", type="primary", key="pf_reset"):
+            pf_init_session(int(seed), patient, target_bis, episode_min, ql_agent, dqn_agent)
+
+        st.divider()
+        st.subheader("Live disturbance")
+        stim_pct = st.slider(
+            "Stimulus strength (% Ce50 increase)", 15, 30, 25, step=1,
+            help="Surgical stimulation (incision, intubation) makes the patient need "
+                 "more drug for the same depth: the effective Ce50 rises by this much.",
+        )
+        stim_min = st.slider("Stimulus length (minutes)", 2, 5, 3, step=1)
+        if st.button("Simulate surgical stimulus", help="Trigger a Ce50 upward shift now"):
+            if "pf_controllers" in ss:
+                ss.pf_stim_shift = stim_pct / 100.0
+                ss.pf_stim_until = ss.pf_t + int(stim_min * 60 / PF_DT)
+                ss.pf_events.append({"t": ss.pf_t * PF_DT / 60.0, "type": "stimulus"})
+
+    if "pf_controllers" not in ss:
+        pf_init_session(int(seed), patient, target_bis, episode_min, ql_agent, dqn_agent)
+
+    if ss.pf_auto_running and ss.pf_t < ss.pf_n_steps:
+        pf_step_all()
+
+    if ss.pf_rows:
+        df = pd.DataFrame(ss.pf_rows).set_index("t")
+        names = list(ss.pf_controllers.keys())
+        events = ss.get("pf_events", [])
+
+        st.altair_chart(pf_bis_chart(df, names, events), width="stretch", key="pf_bis_chart")
+        st.subheader("Effect-site concentration (Ce)")
+        ce_chart = pf_line_chart(df, [f"{n} Ce" for n in names], PF_CE_Y_DOMAIN, "Ce (ug/mL)",
+                                 rename_suffix=" Ce")
+        st.altair_chart(add_event_markers(ce_chart, events), width="stretch", key="pf_ce_chart")
+        st.subheader("Infusion rate")
+        rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
+                                   "Propofol infusion (mg/kg/h)", rename_suffix=" rate")
+        st.altair_chart(add_event_markers(rate_chart, events), width="stretch", key="pf_rate_chart")
+
+        st.subheader("Metrics (this episode so far)")
+        st.dataframe(pf_live_metrics(ss), width="stretch")
+        st.caption("Lower is better for every row except time in target; total propofol "
+                   "is context, not a score.")
+
+        batch = load_batch_summary(PF_SUMMARY_PATH)
+        st.subheader("Performance Metrics (batch evaluation)")
+        if batch is None:
+            st.info(f"No batch summary found at `{PF_SUMMARY_PATH}` -- run "
+                    "`python -m src.propofol_evaluate --n_eval 50` to generate it.")
+        else:
+            st.caption(f"Averaged over {batch['n_eval']} randomized test patients with random "
+                       "surgical stimuli (src/propofol_evaluate.py).")
+            table = batch_summary_table(batch)
+            table = table.reindex([r for r in PF_METRIC_ROWS if r in table.index])
+            st.dataframe(table.rename(index=PF_METRIC_ROWS), width="stretch")
+    else:
+        st.info("Click **START** to run, or **Reset episode** in the sidebar to apply new settings.")
+
+    any_env = next(iter(ss.pf_controllers.values())).env
+    st.caption(f"t = {ss.pf_t * PF_DT / 60.0:.1f} / {ss.pf_n_steps * PF_DT / 60.0:.0f} min   "
+               f"patient sensitivity this run: Ce50 = {any_env.bis_model.ce50:.2f} ug/mL, "
+               f"gamma = {any_env.bis_model.gamma:.2f}   current Ce50 shift = "
+               f"{(ss.pf_stim_shift if ss.pf_t < ss.pf_stim_until else 0.0) * 100:.0f}%")
+
+    if ss.pf_auto_running and ss.pf_t < ss.pf_n_steps:
+        time.sleep(0.05)
+        st.rerun()
+
+
 show_splash_once()
+
+simulator = st.sidebar.selectbox("Simulator", [SIM_IV, SIM_PROPOFOL], index=0, key="simulator")
+if simulator == SIM_PROPOFOL:
+    render_propofol_dashboard()
+    st.stop()
 
 st.title("IV Infusion Flow Control: PID vs Q-learning vs DQN")
 

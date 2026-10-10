@@ -138,5 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=None,
                         help="default: 3000 for qlearning, 600 for dqn")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out_dir", type=str, default="results",
+                        help="where the model + training curve are written (default results/)")
     args = parser.parse_args()
-    train(agent_kind=args.agent, n_episodes=args.episodes, seed=args.seed)
+    train(agent_kind=args.agent, n_episodes=args.episodes, seed=args.seed, out_dir=args.out_dir)
