@@ -40,7 +40,7 @@ from src.dqn_agent import DQNAgent, KEffEstimator, _normalize_state
 from src.propofol_environment import PropofolEnv
 from src.propofol_metrics import compute_propofol_metrics
 from src.propofol_pid_tune import TUNED_PID_GAINS, CascadePID
-from src.propofol_train import DECISION_EVERY, MODEL_PATHS, make_dqn_agent, model_prefix
+from src.propofol_train import DECISION_EVERY, MODEL_PATHS, make_dqn_agent
 
 st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", layout="wide")
 
@@ -99,66 +99,6 @@ def _apply_light_config(chart):
     )
 
 
-REWARD_SMOOTH_WINDOWS = [("Q-learning", 200), ("DQN", 50)]
-DEFAULT_REWARD_SMOOTH_WINDOW = 50
-
-
-def _reward_smooth_window(name):
-    for key, window in REWARD_SMOOTH_WINDOWS:
-        if key.lower() in name.lower():
-            return window
-    return DEFAULT_REWARD_SMOOTH_WINDOW
-
-
-def load_reward_curve(path):
-    """Per-episode training rewards saved by a training script (np.save), or
-    None if that training run hasn't been done / saved yet."""
-    try:
-        return np.load(path)
-    except FileNotFoundError:
-        return None
-
-
-def training_reward_chart(curves):
-    """Raw (very faint) + smoothed (thick moving average; window from
-    REWARD_SMOOTH_WINDOWS -- 200 episodes for Q-learning, 50 for DQN)
-    training-reward-per-episode lines, one pair per curve in `curves`
-    ({label: np.ndarray | None}). Returns None if every curve is missing."""
-    raw_frames, smooth_frames = [], []
-    for name, arr in curves.items():
-        if arr is None or len(arr) == 0:
-            continue
-        episodes = np.arange(len(arr))
-        raw_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": arr}))
-        window = min(_reward_smooth_window(name), len(arr))
-        smoothed = pd.Series(arr).rolling(window, min_periods=1).mean().to_numpy()
-        smooth_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": smoothed}))
-    if not raw_frames:
-        return None
-
-    names = sorted(curves.keys())
-    scale = series_color_scale(names)
-    raw_line = (
-        alt.Chart(pd.concat(raw_frames, ignore_index=True))
-        .mark_line(opacity=0.15, strokeWidth=1)
-        .encode(
-            x=alt.X("episode", title="Training episode"),
-            y=alt.Y("value", title="Episode reward"),
-            color=alt.Color("series", title=None, scale=scale),
-        )
-    )
-    smooth_line = (
-        alt.Chart(pd.concat(smooth_frames, ignore_index=True))
-        .mark_line(strokeWidth=3)
-        .encode(
-            x=alt.X("episode", title="Training episode"),
-            y=alt.Y("value", title="Episode reward"),
-            color=alt.Color("series", title=None, scale=scale),
-        )
-    )
-    return alt.layer(raw_line, smooth_line)
-
-
 def reward_chart(df, cols, x_title, y_title, rename_suffix=""):
     """Per-step line chart for reward-shaped columns (no fixed y-domain --
     unlike the plant-variable charts, reward includes rare large penalties
@@ -176,11 +116,6 @@ def reward_chart(df, cols, x_title, y_title, rename_suffix=""):
             color=alt.Color("series", title=None, scale=series_color_scale(names)),
         )
     )
-
-
-def cumulative_reward_df(df, names, reward_suffix=" reward"):
-    data = {n: df[f"{n}{reward_suffix}"].cumsum() for n in names}
-    return pd.DataFrame(data, index=df.index)
 
 
 def fixed_range_line_chart(df, cols, y_domain, y_title):
@@ -426,9 +361,6 @@ PF_QTABLE_PATH = MODEL_PATHS["qlearning"]   # results/propofol_v2_qlearning_qtab
 PF_DQN_PATH = MODEL_PATHS["dqn"]             # results/propofol_v2_dqn_model.pt
 PF_DT = 5.0                 # s per control step, matches PropofolEnv
 PF_STEPS_PER_TICK = 6       # 30 simulated seconds per screen refresh
-PF_SAFE_BAND = (40.0, 60.0)
-PF_BIS_Y_DOMAIN = (0, 100)
-PF_CE_Y_DOMAIN = (0, 8)
 PF_RATE_Y_DOMAIN = (0, 42)   # infusion levels go to 40; the 1 mg/kg bolus step clips at the top
 
 PF_METRIC_ROWS = {
@@ -557,17 +489,6 @@ def pf_line_chart(df, cols, y_domain, y_title, rename_suffix=""):
     )
 
 
-def pf_bis_chart(df, names, events):
-    band = (
-        alt.Chart(pd.DataFrame({"lo": [PF_SAFE_BAND[0]], "hi": [PF_SAFE_BAND[1]]}))
-        .mark_rect(color="#E8F5E9", opacity=0.9)
-        .encode(y=alt.Y("lo:Q", scale=alt.Scale(domain=list(PF_BIS_Y_DOMAIN))), y2="hi:Q")
-    )
-    lines = pf_line_chart(df, ["target"] + [f"{n} BIS" for n in names], PF_BIS_Y_DOMAIN,
-                          "BIS (0-100)", rename_suffix=" BIS")
-    return add_event_markers(alt.layer(band, lines), events)
-
-
 def pf_live_metrics(ss):
     rows = {}
     for name, ctrl in ss.pf_controllers.items():
@@ -667,41 +588,13 @@ def render_propofol_dashboard():
         names = list(ss.pf_controllers.keys())
         events = ss.get("pf_events", [])
 
-        st.subheader("Graph 1 - BIS (Depth of Anesthesia) vs Time")
-        st.caption(f"Main result. The closer a controller's line stays to the target "
-                   f"({ss.pf_target:.0f}) and inside the 40-60 band, the better.")
-        st.altair_chart(_apply_light_config(pf_bis_chart(df, names, events)), width="stretch", key="pf_bis_chart")
-        st.subheader("Graph 2 - Effect-Site Concentration (Ce) vs Time")
-        st.caption("Drug concentration at the brain. BIS follows this curve with a delay.")
-        ce_chart = pf_line_chart(df, [f"{n} Ce" for n in names], PF_CE_Y_DOMAIN, "Ce (ug/mL)",
-                                 rename_suffix=" Ce")
-        st.altair_chart(_apply_light_config(add_event_markers(ce_chart, events)), width="stretch", key="pf_ce_chart")
-        st.subheader("Graph 3 - Propofol Infusion Rate vs Time")
+        st.subheader("Graph 1 - Propofol Infusion Rate vs Time")
         st.caption("The control action. Smooth is better, constant spikes mean unstable control.")
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
                                    "Infusion (mg/kg/h)", rename_suffix=" rate")
         st.altair_chart(_apply_light_config(add_event_markers(rate_chart, events)), width="stretch", key="pf_rate_chart")
 
-        st.subheader("Graph 4 - Training Reward per Episode (RL learning curve)")
-        st.caption("Reward the agent earned in each training episode. A rising, flattening "
-                   "curve means it is learning. Light lines are raw episode rewards, thick "
-                   "lines are the moving average.")
-        pf_curves = {
-            "Q-learning (RL)": load_reward_curve(f"{model_prefix('qlearning')}_rewards.npy"),
-            "DQN (RL)": load_reward_curve(f"{model_prefix('dqn')}_rewards.npy"),
-        }
-        pf_train_chart = training_reward_chart(pf_curves)
-        if pf_train_chart is not None:
-            st.altair_chart(_apply_light_config(pf_train_chart), width="stretch", key="pf_train_reward_chart")
-        missing = [n for n, a in pf_curves.items() if a is None]
-        if missing:
-            st.info(
-                "No saved training-reward log for " + ", ".join(missing) + " -- run "
-                "`python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0` and/or "
-                "`python -m src.propofol_train --agent dqn --episodes 1500 --seed 0` to generate it."
-            )
-
-        st.subheader("Graph 5 - Reward per Step (this episode)")
+        st.subheader("Graph 2 - Reward per Step (this episode)")
         st.caption("Higher is better. Shows how each controller scores moment by moment under "
                    "the same reward function. PID does not learn from this reward -- it is "
                    "computed on PID's trajectory for comparison only.")
@@ -710,12 +603,6 @@ def render_propofol_dashboard():
                                        rename_suffix=" reward")
         st.altair_chart(_apply_light_config(add_event_markers(pf_reward_chart, events)),
                         width="stretch", key="pf_reward_step_chart")
-
-        st.subheader("Graph 5b - Cumulative Reward (this episode)")
-        st.caption("Running total of Graph 5. Higher (less negative) is better.")
-        pf_cum_df = cumulative_reward_df(df, names)
-        pf_cum_chart = reward_chart(pf_cum_df, names, "Time (min)", "Cumulative reward")
-        st.altair_chart(_apply_light_config(pf_cum_chart), width="stretch", key="pf_cum_reward_chart")
 
         st.subheader("Table 1 - Performance Metrics (this episode)")
         st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
@@ -870,26 +757,7 @@ if st.session_state.rows:
     flow_chart = add_event_markers(flow_chart, st.session_state.get("events", []))
     st.altair_chart(_apply_light_config(flow_chart), width="stretch", key="flow_chart")
 
-    st.subheader("Graph 2 - Training Reward per Episode (RL learning curve)")
-    st.caption("Reward the agent earned in each training episode. A rising, flattening "
-               "curve means it is learning. Light lines are raw episode rewards, thick "
-               "lines are the moving average.")
-    iv_curves = {
-        "Q-learning (RL)": load_reward_curve("results/qlearning_rewards.npy"),
-        "DQN (RL)": load_reward_curve("results/dqn_rewards.npy"),
-    }
-    iv_train_chart = training_reward_chart(iv_curves)
-    if iv_train_chart is not None:
-        st.altair_chart(_apply_light_config(iv_train_chart), width="stretch", key="iv_train_reward_chart")
-    missing = [n for n, a in iv_curves.items() if a is None]
-    if missing:
-        st.info(
-            "No saved training-reward log for " + ", ".join(missing) + " -- run "
-            "`python -m src.train --episodes 5000 --seed 0` and/or "
-            "`python -m src.dqn_agent --episodes 2000 --seed 0` to generate it."
-        )
-
-    st.subheader("Graph 3 - Reward per Step (this episode)")
+    st.subheader("Graph 2 - Reward per Step (this episode)")
     st.caption("Higher is better. Shows how each controller scores moment by moment under "
                "the same reward function. PID does not learn from this reward -- it is "
                "computed on PID's trajectory for comparison only.")
