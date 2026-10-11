@@ -26,7 +26,6 @@ Run with:
     streamlit run app.py
 """
 
-import json
 import time
 
 import altair as alt
@@ -59,6 +58,46 @@ SAFE_BAND = 5.0  # mL/hr, matches IVInfusionEnv.safe_band
 FLOW_Y_DOMAIN = (0, 200)
 COMMAND_Y_DOMAIN = (0, 400)
 
+# Fixed per-controller line colors, legible on the light theme's white chart
+# background -- matched by substring so they apply regardless of the " flow"/
+# " BIS"/etc. suffix a given chart's series names carry.
+CONTROLLER_COLORS = [
+    ("PID", "#1565C0"),
+    ("Q-learning", "#EF6C00"),
+    ("DQN", "#2E7D32"),
+    ("target", "#D32F2F"),
+]
+DEFAULT_SERIES_COLOR = "#616161"
+
+
+def series_color_scale(series_names):
+    """alt.Scale mapping each series name to a fixed color via substring match
+    against CONTROLLER_COLORS, so PID/Q-learning/DQN/target keep the same
+    color across every chart in both simulator modes."""
+    def color_for(name):
+        for key, color in CONTROLLER_COLORS:
+            if key.lower() in name.lower():
+                return color
+        return DEFAULT_SERIES_COLOR
+
+    names = list(series_names)
+    return alt.Scale(domain=names, range=[color_for(n) for n in names])
+
+
+AXIS_COLORS = dict(labelColor="#1F2430", titleColor="#1F2430", gridColor="#E0E0E0",
+                    domainColor="#BDBDBD", tickColor="#BDBDBD")
+
+
+def _apply_light_config(chart):
+    """Explicit light axis/legend/view styling, independent of whatever Vega
+    theme Streamlit's own light config.toml theme applies -- keeps charts
+    readable even if that theming isn't picked up."""
+    return (
+        chart.configure_axis(**AXIS_COLORS)
+        .configure_legend(labelColor="#1F2430", titleColor="#1F2430")
+        .configure_view(strokeWidth=0)
+    )
+
 
 def fixed_range_line_chart(df, cols, y_domain, y_title):
     """Multi-line chart with a pinned y-axis domain, built with Altair (st.line_chart
@@ -71,7 +110,7 @@ def fixed_range_line_chart(df, cols, y_domain, y_title):
         .encode(
             x=alt.X("t", title="Time (s)"),
             y=alt.Y("value", title=y_title, scale=alt.Scale(domain=list(y_domain))),
-            color=alt.Color("series", title=None),
+            color=alt.Color("series", title=None, scale=series_color_scale(cols)),
         )
     )
     return chart
@@ -172,45 +211,6 @@ def show_splash_once():
     time.sleep(SPLASH_SECONDS)
     placeholder.empty()
     st.session_state.splash_shown = True
-
-
-def best_by(values, lower_is_better=True):
-    """(label, value) of the winning controller(s). Ties are reported as ties
-    rather than silently resolved by dict order, which would always favour
-    whichever controller happens to be inserted first."""
-    target = min(values.values()) if lower_is_better else max(values.values())
-    winners = [name for name, v in values.items() if v == target]
-    label = winners[0] if len(winners) == 1 else ", ".join(winners) + " (tied)"
-    return label, target
-
-
-def load_batch_summary(path="results/eval_summary.json"):
-    """Batch metrics written by src/evaluate.py, or None if it hasn't been run."""
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-
-
-def batch_summary_table(batch):
-    rows = {}
-    for controller, metrics in batch["controllers"].items():
-        rows[controller] = {k: v["mean"] for k, v in metrics.items()}
-    return pd.DataFrame(rows).round(2)
-
-
-# Plain-language row labels for the performance metrics table, display only --
-# the underlying metric keys/values from src/evaluate.py are unchanged. Only
-# these four metrics are shown in the table (see PERFORMANCE_METRIC_ROWS).
-METRIC_DISPLAY_LABELS = {
-    "IAE": "Total Tracking Error (IAE)",
-    "ISE": "Total Error, Big Misses Count More (ISE)",
-    "ITAE": "Time-Weighted Tracking Error (ITAE)",
-    "ITSE": "Time-Weighted Big-Miss Error (ITSE)",
-}
-
-PERFORMANCE_METRIC_ROWS = ["IAE", "ISE", "ITAE", "ITSE"]
 
 
 def discretize(err, derr, pending):
@@ -453,13 +453,14 @@ def pf_line_chart(df, cols, y_domain, y_title, rename_suffix=""):
     long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
     if rename_suffix:
         long_df["series"] = long_df["series"].str.replace(rename_suffix, "", regex=False)
+    series_names = sorted(long_df["series"].unique().tolist())
     return (
         alt.Chart(long_df)
         .mark_line()
         .encode(
             x=alt.X("t", title="Time (min)"),
             y=alt.Y("value", title=y_title, scale=alt.Scale(domain=list(y_domain), clamp=True)),
-            color=alt.Color("series", title=None),
+            color=alt.Color("series", title=None, scale=series_color_scale(series_names)),
         )
     )
 
@@ -467,7 +468,7 @@ def pf_line_chart(df, cols, y_domain, y_title, rename_suffix=""):
 def pf_bis_chart(df, names, events):
     band = (
         alt.Chart(pd.DataFrame({"lo": [PF_SAFE_BAND[0]], "hi": [PF_SAFE_BAND[1]]}))
-        .mark_rect(color="green", opacity=0.10)
+        .mark_rect(color="#E8F5E9", opacity=0.9)
         .encode(y=alt.Y("lo:Q", scale=alt.Scale(domain=list(PF_BIS_Y_DOMAIN))), y2="hi:Q")
     )
     lines = pf_line_chart(df, ["target"] + [f"{n} BIS" for n in names], PF_BIS_Y_DOMAIN,
@@ -575,17 +576,17 @@ def render_propofol_dashboard():
         st.subheader("Graph 1 - BIS (Depth of Anesthesia) vs Time")
         st.caption(f"Main result. The closer a controller's line stays to the target "
                    f"({ss.pf_target:.0f}) and inside the 40-60 band, the better.")
-        st.altair_chart(pf_bis_chart(df, names, events), width="stretch", key="pf_bis_chart")
+        st.altair_chart(_apply_light_config(pf_bis_chart(df, names, events)), width="stretch", key="pf_bis_chart")
         st.subheader("Graph 2 - Effect-Site Concentration (Ce) vs Time")
         st.caption("Drug concentration at the brain. BIS follows this curve with a delay.")
         ce_chart = pf_line_chart(df, [f"{n} Ce" for n in names], PF_CE_Y_DOMAIN, "Ce (ug/mL)",
                                  rename_suffix=" Ce")
-        st.altair_chart(add_event_markers(ce_chart, events), width="stretch", key="pf_ce_chart")
+        st.altair_chart(_apply_light_config(add_event_markers(ce_chart, events)), width="stretch", key="pf_ce_chart")
         st.subheader("Graph 3 - Propofol Infusion Rate vs Time")
         st.caption("The control action. Smooth is better, constant spikes mean unstable control.")
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
                                    "Infusion (mg/kg/h)", rename_suffix=" rate")
-        st.altair_chart(add_event_markers(rate_chart, events), width="stretch", key="pf_rate_chart")
+        st.altair_chart(_apply_light_config(add_event_markers(rate_chart, events)), width="stretch", key="pf_rate_chart")
 
         st.subheader("Table 1 - Performance Metrics (this episode)")
         st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
@@ -738,7 +739,7 @@ if st.session_state.rows:
     flow_cols = ["target"] + [f"{name} flow" for name in active_names]
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
     flow_chart = add_event_markers(flow_chart, st.session_state.get("events", []))
-    st.altair_chart(flow_chart, width="stretch", key="flow_chart")
+    st.altair_chart(_apply_light_config(flow_chart), width="stretch", key="flow_chart")
 
     st.subheader("Running error stats (this episode so far)")
     abs_err = {name: (df["target"] - df[f"{name} flow"]).abs() for name in active_names}
@@ -747,40 +748,6 @@ if st.session_state.rows:
         col.metric(f"{name}: average tracking error (mL/hr)", f"{abs_err[name].mean():.2f}")
         col.metric(f"{name}: flow right now (mL/hr)", f"{df[f'{name} flow'].iloc[-1]:.1f}")
 
-    mean_errors = {name: float(e.mean()) for name, e in abs_err.items()}
-    max_errors = {name: float(e.max()) for name, e in abs_err.items()}
-    in_band = {name: float((e <= SAFE_BAND).mean() * 100.0) for name, e in abs_err.items()}
-
-    best_mean, best_mean_val = best_by(mean_errors)
-    best_max, best_max_val = best_by(max_errors)
-    best_band, best_band_val = best_by(in_band, lower_is_better=False)
-
-    st.markdown(f"- **Most accurate overall:** `{best_mean}` at {best_mean_val:.2f} mL/hr")
-    st.markdown(f"- **Best at avoiding big spikes:** `{best_max}` at {best_max_val:.2f} mL/hr")
-    st.markdown(f"- **Most time staying on-target (+-{SAFE_BAND:.0f} mL/hr):** `{best_band}` at {best_band_val:.1f}%")
-
-    st.caption(
-        "Different metrics favour different controllers - mean error rewards steady "
-        "tracking, worst-case error rewards avoiding large excursions."
-    )
-
-    batch = load_batch_summary()
-    st.subheader("Table 1 - Performance Metrics")
-    if batch is None:
-        st.info(
-            "No batch summary found at `results/eval_summary.json` -- run "
-            "`python -m src.evaluate --n_eval 30 --dqn_model results/dqn_model.pt` to generate it."
-        )
-    else:
-        st.caption(
-            f"Averaged over {batch['n_eval']} test runs with different random conditions "
-            "- this is the reliable comparison, since a single run can be noisy. Lower is "
-            "better for every row except time on-target."
-        )
-        table = batch_summary_table(batch)
-        table = table.reindex([r for r in PERFORMANCE_METRIC_ROWS if r in table.index])
-        table = table.rename(index=METRIC_DISPLAY_LABELS)
-        st.dataframe(table, width="stretch")
 else:
     st.info("Click **Reset episode** in the sidebar to start.")
 
