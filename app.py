@@ -33,14 +33,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src.environment import IVInfusionPlant
+from src.environment import IVInfusionPlant, iv_reward
 from src.pid_controller import PIDController
 from src.q_learning_agent import QLearningAgent
 from src.dqn_agent import DQNAgent, KEffEstimator, _normalize_state
 from src.propofol_environment import PropofolEnv
 from src.propofol_metrics import compute_propofol_metrics
 from src.propofol_pid_tune import TUNED_PID_GAINS, CascadePID
-from src.propofol_train import DECISION_EVERY, MODEL_PATHS, make_dqn_agent
+from src.propofol_train import DECISION_EVERY, MODEL_PATHS, make_dqn_agent, model_prefix
 
 st.set_page_config(page_title="IV Infusion Control: PID vs Q-learning vs DQN", layout="wide")
 
@@ -97,6 +97,82 @@ def _apply_light_config(chart):
         .configure_legend(labelColor="#1F2430", titleColor="#1F2430")
         .configure_view(strokeWidth=0)
     )
+
+
+REWARD_SMOOTH_WINDOW = 50
+
+
+def load_reward_curve(path):
+    """Per-episode training rewards saved by a training script (np.save), or
+    None if that training run hasn't been done / saved yet."""
+    try:
+        return np.load(path)
+    except FileNotFoundError:
+        return None
+
+
+def training_reward_chart(curves):
+    """Raw (faint) + smoothed (thick, REWARD_SMOOTH_WINDOW-episode moving
+    average) training-reward-per-episode lines, one pair per curve in
+    `curves` ({label: np.ndarray | None}). Returns None if every curve is
+    missing."""
+    raw_frames, smooth_frames = [], []
+    for name, arr in curves.items():
+        if arr is None or len(arr) == 0:
+            continue
+        episodes = np.arange(len(arr))
+        raw_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": arr}))
+        window = min(REWARD_SMOOTH_WINDOW, len(arr))
+        smoothed = pd.Series(arr).rolling(window, min_periods=1).mean().to_numpy()
+        smooth_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": smoothed}))
+    if not raw_frames:
+        return None
+
+    names = sorted(curves.keys())
+    scale = series_color_scale(names)
+    raw_line = (
+        alt.Chart(pd.concat(raw_frames, ignore_index=True))
+        .mark_line(opacity=0.3, strokeWidth=1)
+        .encode(
+            x=alt.X("episode", title="Training episode"),
+            y=alt.Y("value", title="Episode reward"),
+            color=alt.Color("series", title=None, scale=scale),
+        )
+    )
+    smooth_line = (
+        alt.Chart(pd.concat(smooth_frames, ignore_index=True))
+        .mark_line(strokeWidth=3)
+        .encode(
+            x=alt.X("episode", title="Training episode"),
+            y=alt.Y("value", title="Episode reward"),
+            color=alt.Color("series", title=None, scale=scale),
+        )
+    )
+    return alt.layer(raw_line, smooth_line)
+
+
+def reward_chart(df, cols, x_title, y_title, rename_suffix=""):
+    """Per-step line chart for reward-shaped columns (no fixed y-domain --
+    unlike the plant-variable charts, reward includes rare large penalties
+    e.g. the propofol early-termination penalty, which should be visible)."""
+    long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
+    if rename_suffix:
+        long_df["series"] = long_df["series"].str.replace(rename_suffix, "", regex=False)
+    names = sorted(long_df["series"].unique().tolist())
+    return (
+        alt.Chart(long_df)
+        .mark_line()
+        .encode(
+            x=alt.X("t", title=x_title),
+            y=alt.Y("value", title=y_title),
+            color=alt.Color("series", title=None, scale=series_color_scale(names)),
+        )
+    )
+
+
+def cumulative_reward_df(df, names, reward_suffix=" reward"):
+    data = {n: df[f"{n}{reward_suffix}"].cumsum() for n in names}
+    return pd.DataFrame(data, index=df.index)
 
 
 def fixed_range_line_chart(df, cols, y_domain, y_title):
@@ -262,17 +338,21 @@ class SimController:
         pending = self.plant.pending_correction()
 
         if self.kind == "pid":
+            old_u = self.plant.u
             u = self.pid.compute(err)
             self.plant.set_command(u)
+            du = self.plant.u - old_u  # PID has no discrete action; use the actual commanded change
         elif self.kind == "qlearning":
             s = discretize(err, derr, pending)
             a = self.agent.select_action(s, greedy=True)
-            self.plant.set_command(self.plant.u + ACTIONS[a])
+            du = ACTIONS[a]
+            self.plant.set_command(self.plant.u + du)
         elif self.kind == "dqn":
             k_hat = self.k_eff_estimator.estimate
             state = _normalize_state(err, derr, pending, k_hat, ERR_CLIP, DERR_CLIP, PENDING_CLIP)
             a = self.agent.select_action(state, greedy=True)
-            self.plant.set_command(self.plant.u + ACTIONS[a])
+            du = ACTIONS[a]
+            self.plant.set_command(self.plant.u + du)
 
         self.plant.apply_occlusion(k_eff)
         self.plant.apply_pressure_disturbance(d_p)
@@ -281,8 +361,10 @@ class SimController:
         if self.kind == "dqn":
             self.k_eff_estimator.update(self.plant.u, measured)
 
-        self.prev_err = target - measured
-        return measured, self.plant.u
+        new_err = target - measured
+        reward = iv_reward(new_err, du)  # same formula IVInfusionEnv.step trains on
+        self.prev_err = new_err
+        return measured, self.plant.u, reward
 
 
 def init_session(target, seed, episode_len, ql_agent, dqn_agent):
@@ -315,9 +397,10 @@ def step_all():
     ss.k_eff = k_eff
     row = {"t": ss.t, "target": ss.target, "k_eff": k_eff}
     for name, ctrl in ss.controllers.items():
-        measured, command = ctrl.step(ss.target, k_eff, ss.d_p)
+        measured, command, reward = ctrl.step(ss.target, k_eff, ss.d_p)
         row[f"{name} flow"] = measured
         row[f"{name} command"] = command
+        row[f"{name} reward"] = reward
     ss.rows.append(row)
     ss.t += 1
 
@@ -443,6 +526,7 @@ def pf_step_all():
             row[f"{name} BIS"] = h["measured"] if h else np.nan
             row[f"{name} Ce"] = h["ce"] if h else np.nan
             row[f"{name} rate"] = h["rate_mg_kg_h"] if h else np.nan
+            row[f"{name} reward"] = h["reward"] if h else np.nan
         ss.pf_rows.append(row)
         ss.pf_t += 1
 
@@ -485,7 +569,9 @@ def pf_live_metrics(ss):
         # n_steps = elapsed steps: a controller that ended the episode early
         # (BIS < 20) is scored as staying there up to "now"
         m = compute_propofol_metrics(hist, [], max(ss.pf_t, len(hist)), PF_DT)
-        rows[name] = {label: m[key] for key, label in PF_METRIC_ROWS.items()}
+        row = {label: m[key] for key, label in PF_METRIC_ROWS.items()}
+        row["Total episode reward"] = float(sum(h["reward"] for h in hist))
+        rows[name] = row
     return pd.DataFrame(rows).round(1)
 
 
@@ -587,6 +673,40 @@ def render_propofol_dashboard():
         rate_chart = pf_line_chart(df, [f"{n} rate" for n in names], PF_RATE_Y_DOMAIN,
                                    "Infusion (mg/kg/h)", rename_suffix=" rate")
         st.altair_chart(_apply_light_config(add_event_markers(rate_chart, events)), width="stretch", key="pf_rate_chart")
+
+        st.subheader("Graph 4 - Training Reward per Episode (RL learning curve)")
+        st.caption("Reward the agent earned in each training episode. A rising, flattening "
+                   "curve means it is learning.")
+        pf_curves = {
+            "Q-learning (RL)": load_reward_curve(f"{model_prefix('qlearning')}_rewards.npy"),
+            "DQN (RL)": load_reward_curve(f"{model_prefix('dqn')}_rewards.npy"),
+        }
+        pf_train_chart = training_reward_chart(pf_curves)
+        if pf_train_chart is not None:
+            st.altair_chart(_apply_light_config(pf_train_chart), width="stretch", key="pf_train_reward_chart")
+        missing = [n for n, a in pf_curves.items() if a is None]
+        if missing:
+            st.info(
+                "No saved training-reward log for " + ", ".join(missing) + " -- run "
+                "`python -m src.propofol_train --agent qlearning --episodes 20000 --seed 0` and/or "
+                "`python -m src.propofol_train --agent dqn --episodes 1500 --seed 0` to generate it."
+            )
+
+        st.subheader("Graph 5 - Reward per Step (this episode)")
+        st.caption("Higher is better. Shows how each controller scores moment by moment under "
+                   "the same reward function. PID does not learn from this reward -- it is "
+                   "computed on PID's trajectory for comparison only.")
+        reward_cols = [f"{n} reward" for n in names]
+        pf_reward_chart = reward_chart(df, reward_cols, "Time (min)", "Reward per step",
+                                       rename_suffix=" reward")
+        st.altair_chart(_apply_light_config(add_event_markers(pf_reward_chart, events)),
+                        width="stretch", key="pf_reward_step_chart")
+
+        st.subheader("Graph 5b - Cumulative Reward (this episode)")
+        st.caption("Running total of Graph 5. Higher (less negative) is better.")
+        pf_cum_df = cumulative_reward_df(df, names)
+        pf_cum_chart = reward_chart(pf_cum_df, names, "Time (min)", "Cumulative reward")
+        st.altair_chart(_apply_light_config(pf_cum_chart), width="stretch", key="pf_cum_reward_chart")
 
         st.subheader("Table 1 - Performance Metrics (this episode)")
         st.caption("Time in target, % time BIS<40 (too deep), % time BIS>60 (too light), IAE, "
@@ -740,6 +860,34 @@ if st.session_state.rows:
     flow_chart = fixed_range_line_chart(df, flow_cols, FLOW_Y_DOMAIN, "Flow (mL/hr)")
     flow_chart = add_event_markers(flow_chart, st.session_state.get("events", []))
     st.altair_chart(_apply_light_config(flow_chart), width="stretch", key="flow_chart")
+
+    st.subheader("Graph 2 - Training Reward per Episode (RL learning curve)")
+    st.caption("Reward the agent earned in each training episode. A rising, flattening "
+               "curve means it is learning.")
+    iv_curves = {
+        "Q-learning (RL)": load_reward_curve("results/qlearning_rewards.npy"),
+        "DQN (RL)": load_reward_curve("results/dqn_rewards.npy"),
+    }
+    iv_train_chart = training_reward_chart(iv_curves)
+    if iv_train_chart is not None:
+        st.altair_chart(_apply_light_config(iv_train_chart), width="stretch", key="iv_train_reward_chart")
+    missing = [n for n, a in iv_curves.items() if a is None]
+    if missing:
+        st.info(
+            "No saved training-reward log for " + ", ".join(missing) + " -- run "
+            "`python -m src.train --episodes 5000 --seed 0` and/or "
+            "`python -m src.dqn_agent --episodes 2000 --seed 0` to generate it."
+        )
+
+    st.subheader("Graph 3 - Reward per Step (this episode)")
+    st.caption("Higher is better. Shows how each controller scores moment by moment under "
+               "the same reward function. PID does not learn from this reward -- it is "
+               "computed on PID's trajectory for comparison only.")
+    iv_reward_cols = [f"{name} reward" for name in active_names]
+    iv_reward_chart = reward_chart(df, iv_reward_cols, "Time (s)", "Reward per step",
+                                   rename_suffix=" reward")
+    st.altair_chart(_apply_light_config(add_event_markers(iv_reward_chart, st.session_state.get("events", []))),
+                    width="stretch", key="iv_reward_step_chart")
 
     st.subheader("Running error stats (this episode so far)")
     abs_err = {name: (df["target"] - df[f"{name} flow"]).abs() for name in active_names}

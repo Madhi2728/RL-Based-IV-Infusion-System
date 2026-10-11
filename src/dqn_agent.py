@@ -312,6 +312,7 @@ def train_dqn(n_episodes=3000, seed=0, out_prefix="results/dqn"):
             print(f"episode {ep+1}/{n_episodes}  avg_reward(last200)={recent:.2f}  eps={agent.eps:.3f}")
 
     agent.save(f"{out_prefix}_model.pt")
+    np.save(f"{out_prefix}_rewards.npy", np.array(ep_rewards))
 
     plt.figure(figsize=(8, 4))
     window = 50

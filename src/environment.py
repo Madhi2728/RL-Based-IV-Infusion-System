@@ -92,6 +92,19 @@ a real deployment would actually use.
 import numpy as np
 
 
+def iv_reward(err, du, safe_band=5.0, tight_band=1.5):
+    """IVInfusionEnv.step's reward formula, factored out so app.py can show
+    the identical reward on PID's trajectory for comparison (PID is not part
+    of this env's training loop, so it never calls this on its own)."""
+    reward = -abs(err) / 20.0
+    reward -= 0.02 * abs(du)
+    if abs(err) > safe_band:
+        reward -= 0.15 * (abs(err) - safe_band)
+    if abs(err) < tight_band:
+        reward += 0.5
+    return reward
+
+
 class IVInfusionPlant:
     """Continuous-time plant dynamics, Euler-integrated, with transport delay.
 
@@ -330,16 +343,12 @@ class IVInfusionEnv:
         err = self.target - measured
         derr = err - self.prev_err
 
-        reward = -abs(err) / 20.0
-        reward -= 0.02 * abs(du)
-        if abs(err) > self.safe_band:
-            reward -= 0.15 * (abs(err) - self.safe_band)
-        if abs(err) < self.tight_band:
-            reward += 0.5
+        reward = iv_reward(err, du, self.safe_band, self.tight_band)
 
         self.history.append(dict(
             t=self.step_idx * self.dt, target=self.target, measured=measured,
             command=self.plant.u, error=err, k_eff=self.plant.k_eff, d_p=self.plant.d_p,
+            reward=reward,
         ))
 
         self.prev_err = err

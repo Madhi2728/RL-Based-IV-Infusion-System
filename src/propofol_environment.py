@@ -570,6 +570,7 @@ class PropofolEnv:
             bis_true=bis_true, ce=ce, cp=cp, rate_mg_kg_h=u * 3600.0 / self.patient["weight"],
             rate_mg_s=u, bolus_mg=bolus_mg, command=rate_mg_kg_h, action=action,
             stim_shift=shift, ce50_eff=self.bis_model.ce50 * (1.0 + shift),
+            reward=reward,
         ))
 
         self.bis, self.err = bis, err
