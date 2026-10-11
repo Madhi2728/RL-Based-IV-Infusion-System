@@ -100,7 +100,8 @@ def _apply_light_config(chart):
 
 
 PID_DASH = [6, 3]
-REWARD_DRAW_ORDER = ["Q-learning", "DQN", "PID"]  # PID drawn last (on top), per-name substring match
+REWARD_DRAW_ORDER = ["Q-learning", "DQN", "PID"]  # z-order: PID drawn last (on top)
+REWARD_LEGEND_ORDER = ["DQN (RL)", "PID (classic controller)", "Q-learning (RL)"]
 
 
 def _reward_draw_order_key(name):
@@ -114,52 +115,68 @@ def reward_chart(df, cols, x_title, window, rename_suffix="", y_pad=1.2, height=
     """Reward-per-step chart: a very light, thin raw line per controller with
     a thick `window`-step moving average on top in the same color (edge
     handling via min_periods=1, so the first/last points aren't pulled toward
-    zero). Lines are drawn in REWARD_DRAW_ORDER (PID last/on top, dashed, so
-    it stays visible where lines overlap near the max reward). Fixed y-range
-    from the real data min to y_pad above the real max, with a light dashed
-    reference line at that max."""
+    zero). Built as two combined multi-series charts (raw, smooth) -- the
+    same shape as the other graphs' single alt.Color("series", ...) charts
+    -- so the legend looks and sits exactly like theirs (right side,
+    vertical, default styling): only the smooth layer's color encoding
+    keeps a legend (raw's is legend=None), in REWARD_LEGEND_ORDER. PID is
+    dashed and painted last/on top via a separate order column, independent
+    of legend order and channel (its legend swatch stays a plain solid
+    line, since strokeDash itself carries no legend)."""
     long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
     if rename_suffix:
         long_df["series"] = long_df["series"].str.replace(rename_suffix, "", regex=False)
-    names = sorted(long_df["series"].unique().tolist(), key=_reward_draw_order_key)
-    scale = series_color_scale(names)
+
+    present = long_df["series"].unique().tolist()
+    draw_rank = {n: i for i, n in enumerate(sorted(present, key=_reward_draw_order_key))}
+    legend_names = [n for n in REWARD_LEGEND_ORDER if n in present]
+    legend_names += [n for n in present if n not in legend_names]
+    scale = series_color_scale(legend_names)
+
+    long_df["draw_order"] = long_df["series"].map(draw_rank)
+    long_df["dash"] = long_df["series"].apply(lambda n: "pid" if "pid" in n.lower() else "solid")
+
+    smooth_df = long_df.sort_values(["series", "t"]).copy()
+    smooth_df["value"] = smooth_df.groupby("series")["value"].transform(
+        lambda s: s.rolling(window, min_periods=1).mean())
 
     values = long_df["value"].dropna()
     y_min = float(values.min()) if len(values) else -1.0
     y_max = float(values.max()) if len(values) else 1.0
     y_scale = alt.Scale(domain=[y_min, y_max + y_pad])
     y_axis = alt.Axis(tickCount=6)
-    # Legend swatches come ONLY from the (full-opacity, thick) moving-average
-    # layer -- the raw layer's color encoding has legend=None -- so the
-    # legend never inherits the raw line's 0.25 opacity. symbolSize lengthens
-    # the stroke swatch (Vega-Lite has no direct "legend line length" knob).
-    legend = alt.Legend(orient="top", direction="horizontal", title=None,
-                        symbolType="stroke", symbolStrokeWidth=4, symbolSize=120,
-                        symbolOpacity=1.0, labelColor="#1F2430", labelFontSize=13)
-    color_legend = alt.Color("series", title=None, scale=scale, legend=legend)
-    color_no_legend = alt.Color("series", title=None, scale=scale, legend=None)
+    dash_enc = alt.StrokeDash("dash:N", scale=alt.Scale(domain=["solid", "pid"], range=[[1, 0], PID_DASH]),
+                              legend=None)
+    order_enc = alt.Order("draw_order:Q")
 
-    layers = []
-    for name in names:
-        sub = long_df[long_df["series"] == name].sort_values("t")
-        smoothed = sub.assign(value=sub["value"].rolling(window, min_periods=1).mean())
-        dash = PID_DASH if "pid" in name.lower() else [1, 0]
-        raw_enc = dict(
+    raw_line = (
+        alt.Chart(long_df)
+        .mark_line(opacity=0.25, strokeWidth=1)
+        .encode(
             x=alt.X("t", title=x_title),
             y=alt.Y("value", title="Reward per step", scale=y_scale, axis=y_axis),
-            color=color_no_legend,
+            color=alt.Color("series", title=None, scale=scale, legend=None),
+            strokeDash=dash_enc,
+            order=order_enc,
         )
-        smooth_enc = dict(raw_enc, color=color_legend)
-        raw_line = alt.Chart(sub).mark_line(opacity=0.25, strokeWidth=1, strokeDash=dash).encode(**raw_enc)
-        smooth_line = alt.Chart(smoothed).mark_line(strokeWidth=3, opacity=1.0, strokeDash=dash).encode(**smooth_enc)
-        layers.append(alt.layer(raw_line, smooth_line))
-
+    )
+    smooth_line = (
+        alt.Chart(smooth_df)
+        .mark_line(strokeWidth=3, opacity=1.0)
+        .encode(
+            x=alt.X("t", title=x_title),
+            y=alt.Y("value", title="Reward per step", scale=y_scale, axis=y_axis),
+            color=alt.Color("series", title=None, scale=scale),
+            strokeDash=dash_enc,
+            order=order_enc,
+        )
+    )
     ref_line = (
         alt.Chart(pd.DataFrame({"y": [y_max]}))
         .mark_rule(strokeDash=[4, 4], color="#9E9E9E", opacity=0.6)
         .encode(y=alt.Y("y:Q", scale=y_scale, axis=y_axis))
     )
-    return alt.layer(ref_line, *layers).properties(height=height)
+    return alt.layer(ref_line, raw_line, smooth_line).properties(height=height)
 
 
 def fixed_range_line_chart(df, cols, y_domain, y_title):
