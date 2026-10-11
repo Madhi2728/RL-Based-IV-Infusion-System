@@ -684,7 +684,8 @@ def render_propofol_dashboard():
 
         st.subheader("Graph 4 - Training Reward per Episode (RL learning curve)")
         st.caption("Reward the agent earned in each training episode. A rising, flattening "
-                   "curve means it is learning.")
+                   "curve means it is learning. Light lines are raw episode rewards, thick "
+                   "lines are the moving average.")
         pf_curves = {
             "Q-learning (RL)": load_reward_curve(f"{model_prefix('qlearning')}_rewards.npy"),
             "DQN (RL)": load_reward_curve(f"{model_prefix('dqn')}_rewards.npy"),
@@ -871,7 +872,8 @@ if st.session_state.rows:
 
     st.subheader("Graph 2 - Training Reward per Episode (RL learning curve)")
     st.caption("Reward the agent earned in each training episode. A rising, flattening "
-               "curve means it is learning.")
+               "curve means it is learning. Light lines are raw episode rewards, thick "
+               "lines are the moving average.")
     iv_curves = {
         "Q-learning (RL)": load_reward_curve("results/qlearning_rewards.npy"),
         "DQN (RL)": load_reward_curve("results/dqn_rewards.npy"),
