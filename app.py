@@ -99,23 +99,58 @@ def _apply_light_config(chart):
     )
 
 
-def reward_chart(df, cols, x_title, y_title, rename_suffix=""):
-    """Per-step line chart for reward-shaped columns (no fixed y-domain --
-    unlike the plant-variable charts, reward includes rare large penalties
-    e.g. the propofol early-termination penalty, which should be visible)."""
+PID_DASH = [6, 3]
+REWARD_DRAW_ORDER = ["Q-learning", "DQN", "PID"]  # PID drawn last (on top), per-name substring match
+
+
+def _reward_draw_order_key(name):
+    for i, key in enumerate(REWARD_DRAW_ORDER):
+        if key.lower() in name.lower():
+            return i
+    return len(REWARD_DRAW_ORDER)
+
+
+def reward_chart(df, cols, x_title, window, rename_suffix="", y_pad=1.2, height=340):
+    """Reward-per-step chart: a very light, thin raw line per controller with
+    a thick `window`-step moving average on top in the same color (edge
+    handling via min_periods=1, so the first/last points aren't pulled toward
+    zero). Lines are drawn in REWARD_DRAW_ORDER (PID last/on top, dashed, so
+    it stays visible where lines overlap near the max reward). Fixed y-range
+    from the real data min to y_pad above the real max, with a light dashed
+    reference line at that max."""
     long_df = df[cols].reset_index().melt("t", var_name="series", value_name="value")
     if rename_suffix:
         long_df["series"] = long_df["series"].str.replace(rename_suffix, "", regex=False)
-    names = sorted(long_df["series"].unique().tolist())
-    return (
-        alt.Chart(long_df)
-        .mark_line()
-        .encode(
+    names = sorted(long_df["series"].unique().tolist(), key=_reward_draw_order_key)
+    scale = series_color_scale(names)
+
+    values = long_df["value"].dropna()
+    y_min = float(values.min()) if len(values) else -1.0
+    y_max = float(values.max()) if len(values) else 1.0
+    y_scale = alt.Scale(domain=[y_min, y_max + y_pad])
+    y_axis = alt.Axis(tickCount=6)
+    legend = alt.Legend(orient="top", direction="horizontal", title=None)
+
+    layers = []
+    for name in names:
+        sub = long_df[long_df["series"] == name].sort_values("t")
+        smoothed = sub.assign(value=sub["value"].rolling(window, min_periods=1).mean())
+        dash = PID_DASH if "pid" in name.lower() else [1, 0]
+        enc = dict(
             x=alt.X("t", title=x_title),
-            y=alt.Y("value", title=y_title),
-            color=alt.Color("series", title=None, scale=series_color_scale(names)),
+            y=alt.Y("value", title="Reward per step", scale=y_scale, axis=y_axis),
+            color=alt.Color("series", title=None, scale=scale, legend=legend),
         )
+        raw_line = alt.Chart(sub).mark_line(opacity=0.2, strokeWidth=1, strokeDash=dash).encode(**enc)
+        smooth_line = alt.Chart(smoothed).mark_line(strokeWidth=2.5, strokeDash=dash).encode(**enc)
+        layers.append(alt.layer(raw_line, smooth_line))
+
+    ref_line = (
+        alt.Chart(pd.DataFrame({"y": [y_max]}))
+        .mark_rule(strokeDash=[4, 4], color="#9E9E9E", opacity=0.6)
+        .encode(y=alt.Y("y:Q", scale=y_scale, axis=y_axis))
     )
+    return alt.layer(ref_line, *layers).properties(height=height)
 
 
 def fixed_range_line_chart(df, cols, y_domain, y_title):
@@ -595,11 +630,11 @@ def render_propofol_dashboard():
         st.altair_chart(_apply_light_config(add_event_markers(rate_chart, events)), width="stretch", key="pf_rate_chart")
 
         st.subheader("Graph 2 - Reward per Step (this episode)")
-        st.caption("Higher is better. Shows how each controller scores moment by moment under "
-                   "the same reward function. PID does not learn from this reward -- it is "
-                   "computed on PID's trajectory for comparison only.")
+        st.caption("Higher is better. Thick lines are a short moving average; thin lines are "
+                   "the raw per-step reward. PID is computed on its own trajectory for "
+                   "comparison only.")
         reward_cols = [f"{n} reward" for n in names]
-        pf_reward_chart = reward_chart(df, reward_cols, "Time (min)", "Reward per step",
+        pf_reward_chart = reward_chart(df, reward_cols, "Time (min)", window=5,
                                        rename_suffix=" reward")
         st.altair_chart(_apply_light_config(add_event_markers(pf_reward_chart, events)),
                         width="stretch", key="pf_reward_step_chart")
@@ -758,11 +793,11 @@ if st.session_state.rows:
     st.altair_chart(_apply_light_config(flow_chart), width="stretch", key="flow_chart")
 
     st.subheader("Graph 2 - Reward per Step (this episode)")
-    st.caption("Higher is better. Shows how each controller scores moment by moment under "
-               "the same reward function. PID does not learn from this reward -- it is "
-               "computed on PID's trajectory for comparison only.")
+    st.caption("Higher is better. Thick lines are a short moving average; thin lines are "
+               "the raw per-step reward. PID is computed on its own trajectory for "
+               "comparison only.")
     iv_reward_cols = [f"{name} reward" for name in active_names]
-    iv_reward_chart = reward_chart(df, iv_reward_cols, "Time (s)", "Reward per step",
+    iv_reward_chart = reward_chart(df, iv_reward_cols, "Time (s)", window=3,
                                    rename_suffix=" reward")
     st.altair_chart(_apply_light_config(add_event_markers(iv_reward_chart, st.session_state.get("events", []))),
                     width="stretch", key="iv_reward_step_chart")
