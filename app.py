@@ -99,7 +99,15 @@ def _apply_light_config(chart):
     )
 
 
-REWARD_SMOOTH_WINDOW = 50
+REWARD_SMOOTH_WINDOWS = [("Q-learning", 200), ("DQN", 50)]
+DEFAULT_REWARD_SMOOTH_WINDOW = 50
+
+
+def _reward_smooth_window(name):
+    for key, window in REWARD_SMOOTH_WINDOWS:
+        if key.lower() in name.lower():
+            return window
+    return DEFAULT_REWARD_SMOOTH_WINDOW
 
 
 def load_reward_curve(path):
@@ -112,17 +120,17 @@ def load_reward_curve(path):
 
 
 def training_reward_chart(curves):
-    """Raw (faint) + smoothed (thick, REWARD_SMOOTH_WINDOW-episode moving
-    average) training-reward-per-episode lines, one pair per curve in
-    `curves` ({label: np.ndarray | None}). Returns None if every curve is
-    missing."""
+    """Raw (very faint) + smoothed (thick moving average; window from
+    REWARD_SMOOTH_WINDOWS -- 200 episodes for Q-learning, 50 for DQN)
+    training-reward-per-episode lines, one pair per curve in `curves`
+    ({label: np.ndarray | None}). Returns None if every curve is missing."""
     raw_frames, smooth_frames = [], []
     for name, arr in curves.items():
         if arr is None or len(arr) == 0:
             continue
         episodes = np.arange(len(arr))
         raw_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": arr}))
-        window = min(REWARD_SMOOTH_WINDOW, len(arr))
+        window = min(_reward_smooth_window(name), len(arr))
         smoothed = pd.Series(arr).rolling(window, min_periods=1).mean().to_numpy()
         smooth_frames.append(pd.DataFrame({"episode": episodes, "series": name, "value": smoothed}))
     if not raw_frames:
@@ -132,7 +140,7 @@ def training_reward_chart(curves):
     scale = series_color_scale(names)
     raw_line = (
         alt.Chart(pd.concat(raw_frames, ignore_index=True))
-        .mark_line(opacity=0.3, strokeWidth=1)
+        .mark_line(opacity=0.15, strokeWidth=1)
         .encode(
             x=alt.X("episode", title="Training episode"),
             y=alt.Y("value", title="Episode reward"),
