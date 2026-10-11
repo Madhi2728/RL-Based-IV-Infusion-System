@@ -129,20 +129,29 @@ def reward_chart(df, cols, x_title, window, rename_suffix="", y_pad=1.2, height=
     y_max = float(values.max()) if len(values) else 1.0
     y_scale = alt.Scale(domain=[y_min, y_max + y_pad])
     y_axis = alt.Axis(tickCount=6)
-    legend = alt.Legend(orient="top", direction="horizontal", title=None)
+    # Legend swatches come ONLY from the (full-opacity, thick) moving-average
+    # layer -- the raw layer's color encoding has legend=None -- so the
+    # legend never inherits the raw line's 0.25 opacity. symbolSize lengthens
+    # the stroke swatch (Vega-Lite has no direct "legend line length" knob).
+    legend = alt.Legend(orient="top", direction="horizontal", title=None,
+                        symbolType="stroke", symbolStrokeWidth=4, symbolSize=120,
+                        symbolOpacity=1.0, labelColor="#1F2430", labelFontSize=13)
+    color_legend = alt.Color("series", title=None, scale=scale, legend=legend)
+    color_no_legend = alt.Color("series", title=None, scale=scale, legend=None)
 
     layers = []
     for name in names:
         sub = long_df[long_df["series"] == name].sort_values("t")
         smoothed = sub.assign(value=sub["value"].rolling(window, min_periods=1).mean())
         dash = PID_DASH if "pid" in name.lower() else [1, 0]
-        enc = dict(
+        raw_enc = dict(
             x=alt.X("t", title=x_title),
             y=alt.Y("value", title="Reward per step", scale=y_scale, axis=y_axis),
-            color=alt.Color("series", title=None, scale=scale, legend=legend),
+            color=color_no_legend,
         )
-        raw_line = alt.Chart(sub).mark_line(opacity=0.2, strokeWidth=1, strokeDash=dash).encode(**enc)
-        smooth_line = alt.Chart(smoothed).mark_line(strokeWidth=2.5, strokeDash=dash).encode(**enc)
+        smooth_enc = dict(raw_enc, color=color_legend)
+        raw_line = alt.Chart(sub).mark_line(opacity=0.25, strokeWidth=1, strokeDash=dash).encode(**raw_enc)
+        smooth_line = alt.Chart(smoothed).mark_line(strokeWidth=3, opacity=1.0, strokeDash=dash).encode(**smooth_enc)
         layers.append(alt.layer(raw_line, smooth_line))
 
     ref_line = (
